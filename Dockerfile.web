@@ -29,6 +29,19 @@ COPY . .
 # passed via --build-arg in CI when they must be inlined into the client bundle.
 ARG NEXT_PUBLIC_APP_URL=http://localhost:3000
 ENV NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
+# Client-side Sentry DSN — must be inlined into the browser bundle at build time
+# (server-side SENTRY_DSN is injected at runtime via ECS secrets). Empty by
+# default so local builds without Sentry are a no-op.
+ARG NEXT_PUBLIC_SENTRY_DSN=
+ENV NEXT_PUBLIC_SENTRY_DSN=${NEXT_PUBLIC_SENTRY_DSN}
+# Sentry source-map upload creds — withSentryConfig (next.config.ts) uploads
+# maps only when these are present. Pass via --build-arg from CI secrets.
+ARG SENTRY_ORG=
+ARG SENTRY_PROJECT=
+ARG SENTRY_AUTH_TOKEN=
+ENV SENTRY_ORG=${SENTRY_ORG}
+ENV SENTRY_PROJECT=${SENTRY_PROJECT}
+ENV SENTRY_AUTH_TOKEN=${SENTRY_AUTH_TOKEN}
 ENV DATABASE_URL=postgresql://user:pass@localhost:5432/placeholder
 RUN npm run build
 

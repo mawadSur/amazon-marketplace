@@ -22,11 +22,39 @@ const profileSchema = z.object({
   bio: z.string().trim().max(500).optional().or(z.literal("")),
 });
 
+// Government identifier formats (India). Each field is optional (at least one
+// required) so we validate format ONLY when a non-empty value is provided,
+// mirroring the IFSC regex used for bank details below.
+const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[0-9A-Z]{1}Z[0-9A-Z]{1}$/;
+const PAN_RE = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
+const UDYAM_RE = /^UDYAM-[A-Z]{2}-[0-9]{2}-[0-9]{7}$/;
+
+/** Passes when the value is empty (field omitted) or matches `re`. */
+const optionalMatch = (re: RegExp) => (v: string | undefined) => !v || re.test(v);
+
 const kycSchema = z
   .object({
-    gstNumber: z.string().trim().max(32).optional().or(z.literal("")),
-    panNumber: z.string().trim().max(16).optional().or(z.literal("")),
-    udyamNumber: z.string().trim().max(32).optional().or(z.literal("")),
+    gstNumber: z
+      .string()
+      .trim()
+      .max(32)
+      .refine(optionalMatch(GSTIN_RE), "Enter a valid 15-character GSTIN")
+      .optional()
+      .or(z.literal("")),
+    panNumber: z
+      .string()
+      .trim()
+      .max(16)
+      .refine(optionalMatch(PAN_RE), "Enter a valid PAN (e.g. ABCDE1234F)")
+      .optional()
+      .or(z.literal("")),
+    udyamNumber: z
+      .string()
+      .trim()
+      .max(32)
+      .refine(optionalMatch(UDYAM_RE), "Enter a valid Udyam number (e.g. UDYAM-XX-00-0000000)")
+      .optional()
+      .or(z.literal("")),
   })
   .refine(
     (v) => Boolean(v.gstNumber || v.panNumber || v.udyamNumber),

@@ -1,5 +1,5 @@
 {
-  "app": "node bin/app.js",
+  "app": "npx tsc && node dist/bin/app.js",
   "watch": {
     "include": ["**"],
     "exclude": ["README.md", "cdk*.json", "**/*.d.ts", "node_modules", "dist"]

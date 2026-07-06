@@ -5,6 +5,11 @@
 // constant-time compare, then dispatches payout.processed / payout.failed /
 // payout.reversed to markPayoutPaid / markPayoutFailed.
 //
+// NOTE: markPayoutFailed carries a terminal-state guard — a payout WE already
+// flipped to REVERSED (via reversePayoutsForOrder, with its PayoutReversal
+// ledger linkage) is never downgraded to FAILED by an inbound payout.reversed
+// event.
+//
 // FAIL-CLOSED: when the signing secret is unset we NEVER accept an anonymous
 // payout status change in production (env.ts already requires the secret in
 // prod). Only in dev/test does the admin "Mark payout paid" button POST directly.

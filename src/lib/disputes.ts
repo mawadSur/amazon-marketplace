@@ -1,7 +1,8 @@
 // Dispute lifecycle for Module 6. Buyers open disputes on their orders;
 // admins resolve them. All admin mutations write a paired AdminAction in
-// the same transaction. Real refund movement (Stripe/Razorpay) lives in
-// Module 4 — see TODO(module4) below.
+// the same transaction. A buyer-favored resolution flips the Order to REFUNDED
+// AND drives real refund movement: enqueueRefund (Stripe/Razorpay) plus
+// reversePayoutsForOrder to claw back any already-released seller payouts.
 
 import { prisma } from "@/lib/db";
 import { enqueueRefund } from "@/lib/payments";
@@ -50,8 +51,16 @@ const ORDER_OPENABLE_STATUSES = new Set([
 ]);
 
 /**
+ * Buyer-protection claim window: a dispute (and its full refund) can only be
+ * opened within this many days of delivery. Bounds our refund liability so a
+ * buyer can't claw back funds months after receiving the goods.
+ */
+export const DISPUTE_CLAIM_WINDOW_DAYS = 30;
+const DISPUTE_CLAIM_WINDOW_MS = DISPUTE_CLAIM_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+
+/**
  * Open a dispute. Throws ORDER_NOT_FOUND / ORDER_NOT_DISPUTABLE /
- * ALREADY_DISPUTED / DESCRIPTION_REQUIRED.
+ * ALREADY_DISPUTED / DESCRIPTION_REQUIRED / CLAIM_WINDOW_EXPIRED.
  */
 export async function openDispute(input: OpenDisputeInput): Promise<Dispute> {
   const description = input.description?.trim() ?? "";
@@ -59,12 +68,17 @@ export async function openDispute(input: OpenDisputeInput): Promise<Dispute> {
 
   const order = await prisma.order.findFirst({
     where: { id: input.orderId, buyerId: input.buyerId },
-    select: { id: true, status: true, dispute: { select: { id: true } } },
+    select: { id: true, status: true, deliveredAt: true, dispute: { select: { id: true } } },
   });
   if (!order) throw new Error("ORDER_NOT_FOUND");
   if (order.dispute) throw new Error("ALREADY_DISPUTED");
   if (!ORDER_OPENABLE_STATUSES.has(order.status)) {
     throw new Error("ORDER_NOT_DISPUTABLE");
+  }
+  // Claim window: once delivered, the buyer has DISPUTE_CLAIM_WINDOW_DAYS to
+  // open a claim. Undelivered orders (deliveredAt null) are not yet bounded.
+  if (order.deliveredAt && Date.now() - order.deliveredAt.getTime() > DISPUTE_CLAIM_WINDOW_MS) {
+    throw new Error("CLAIM_WINDOW_EXPIRED");
   }
 
   const evidenceUrls = (input.evidenceUrls ?? [])
@@ -114,7 +128,8 @@ export type ResolveDisputeInput = {
 
 /**
  * Resolve a dispute: writes Dispute.status + resolution, an AdminAction, and
- * (for outcome=BUYER) flips Order to REFUNDED as a placeholder. For
+ * (for outcome=BUYER) flips Order to REFUNDED then drives the real refund
+ * (enqueueRefund) + payout clawback (reversePayoutsForOrder). For
  * outcome=SELLER, restores Order to DELIVERED if it was ever delivered.
  */
 export async function resolveDispute(input: ResolveDisputeInput): Promise<Dispute> {

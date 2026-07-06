@@ -51,6 +51,13 @@ const serverSchema = z.object({
   AVATAR_VIDEO_ENABLED: z.string().optional(),
   SHIPROCKET_EMAIL: z.string().optional(),
   SHIPROCKET_PASSWORD: z.string().optional(),
+  // Shared secret authenticating inbound Shiprocket tracking webhooks. The
+  // webhook route fails CLOSED in production when this is absent (matching the
+  // Stripe/Razorpay webhook pattern).
+  SHIPROCKET_WEBHOOK_SECRET: z.string().optional(),
+  // Nickname of a pickup location configured in the Shiprocket dashboard; sent
+  // as `pickup_location` on ad-hoc orders. Defaults to "Primary".
+  SHIPROCKET_PICKUP_LOCATION: z.string().default("Primary"),
   KYC_PROVIDER_API_KEY: z.string().optional(),
   // Base URL of the KYC verification provider's REST API.
   KYC_PROVIDER_BASE_URL: z.string().url().optional(),
@@ -58,6 +65,17 @@ const serverSchema = z.object({
   RESEND_API_KEY: z.string().optional(),
   // Verified "From" address for outbound email (e.g. "Shezmin <no-reply@shezmin.com>").
   EMAIL_FROM: z.string().optional(),
+  // Observability (Sentry). DSN activates server/edge/worker error capture; the
+  // ORG/PROJECT/AUTH_TOKEN triple enables source-map upload during `next build`.
+  SENTRY_DSN: z.string().optional(),
+  SENTRY_ENVIRONMENT: z.string().optional(),
+  SENTRY_ORG: z.string().optional(),
+  SENTRY_PROJECT: z.string().optional(),
+  SENTRY_AUTH_TOKEN: z.string().optional(),
+  // Structured-log verbosity. Defaults to "info" in log.ts when unset.
+  LOG_LEVEL: z.string().optional(),
+  // Used by seed scripts (prisma/seed.ts) for generated imagery.
+  GEMINI_API_KEY: z.string().optional(),
 });
 
 const publicSchema = z.object({
@@ -65,6 +83,8 @@ const publicSchema = z.object({
   // Canonical public site origin (used for canonical URLs, emails, sitemaps).
   NEXT_PUBLIC_SITE_URL: z.string().url().optional(),
   NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: z.string().optional(),
+  NEXT_PUBLIC_SENTRY_DSN: z.string().optional(),
+  NEXT_PUBLIC_SENTRY_ENVIRONMENT: z.string().optional(),
 });
 
 // Keys kept .optional() for dev/test convenience but MUST be present in
@@ -78,6 +98,9 @@ const PRODUCTION_REQUIRED = [
   "RAZORPAY_KEY_ID",
   "RAZORPAY_KEY_SECRET",
   "RAZORPAY_WEBHOOK_SECRET",
+  // Payout source account — required at payout time; fail closed at boot rather
+  // than throwing on the first DELIVERED transition in production.
+  "RAZORPAY_ACCOUNT_NUMBER",
 ] as const;
 
 // During `next build`, Next.js sets NODE_ENV=production and imports server
@@ -113,5 +136,7 @@ export const publicEnv = publicSchema.parse(
     NEXT_PUBLIC_APP_URL: process.env.NEXT_PUBLIC_APP_URL,
     NEXT_PUBLIC_SITE_URL: process.env.NEXT_PUBLIC_SITE_URL,
     NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY,
+    NEXT_PUBLIC_SENTRY_DSN: process.env.NEXT_PUBLIC_SENTRY_DSN,
+    NEXT_PUBLIC_SENTRY_ENVIRONMENT: process.env.NEXT_PUBLIC_SENTRY_ENVIRONMENT,
   }),
 );

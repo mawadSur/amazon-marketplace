@@ -2,12 +2,11 @@ name: CI
 
 # Validation gate for every PR and every push to master.
 #
-# Deployment is handled by Vercel's native Git integration (it auto-deploys
-# master), so this workflow does NOT deploy — it only validates. To have GitHub
-# Actions own the deploy instead, add a deploy job using the Vercel CLI
-# (vercel pull / build / deploy --prebuilt --prod) with VERCEL_TOKEN /
-# VERCEL_ORG_ID / VERCEL_PROJECT_ID secrets, and turn off Vercel's production
-# Git auto-deploy to avoid double-deploying.
+# Deployment is owned by AWS ECS via .github/workflows/deploy.yml (build+push to
+# ECR, prisma migrate, roll the Fargate services). This workflow does NOT deploy
+# — it only validates PRs and master. Vercel is NOT the production target;
+# disable Vercel's production Git auto-deploy in the Vercel dashboard so it does
+# not double-deploy behind ECS.
 
 on:
   push:

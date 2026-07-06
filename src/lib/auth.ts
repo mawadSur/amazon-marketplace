@@ -148,8 +148,12 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         // Reject up front if this IP or account is already locked out.
         await assertNotLockedOut(request, "pw", identifier);
 
+        // Registration stores providerAccountId as the lowercased email, so we
+        // must look up with the same normalized `identifier` — otherwise a user
+        // typing "User@Example.com" would never match their "user@example.com"
+        // account and could not sign in.
         const account = await prisma.account.findFirst({
-          where: { provider: "credentials", providerAccountId: email },
+          where: { provider: "credentials", providerAccountId: identifier },
           include: { user: true },
         });
         if (!account?.access_token) {

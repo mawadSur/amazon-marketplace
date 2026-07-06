@@ -9,9 +9,13 @@ marketplace. **It is its own npm package** (`infra/package.json`,
 - **VPC** — 2 AZs, public + private-with-egress + isolated subnets, 1 NAT,
   interface endpoints (Secrets Manager, ECR, CloudWatch Logs) + S3 gateway.
 - **ECS Fargate cluster** with:
-  - **web** service behind an **internal ALB** (health check `/api/health`),
+  - **web** service behind an **internal ALB**. Container health check =
+    `/api/health` (liveness — survives DB/Redis blips); ALB target group health
+    check = `/api/health/ready` (readiness — hard-fails on a real DB outage so
+    the LB stops routing),
   - **worker** service (no ingress ports),
-  - a one-off **migrate** task definition (`npx prisma migrate deploy`).
+  - a one-off **migrate** task definition (`npx prisma migrate deploy`) with its
+    own security group allowed to reach RDS on 5432.
 - **RDS Postgres** (isolated subnets, encrypted, Multi-AZ in prod).
 - **ElastiCache Redis** with **TLS in transit** + at-rest encryption + AUTH.
 - **S3 media bucket** — Block Public Access + KMS CMND + enforced TLS + versioning.
@@ -21,10 +25,13 @@ marketplace. **It is its own npm package** (`infra/package.json`,
   ALB via a CloudFront **VPC origin** (only when `domainName`/`hostedZoneId`
   are provided).
 - **ECR repos** — `marketplace-web`, `marketplace-worker` (scan-on-push,
-  immutable tags, lifecycle pruning).
+  immutable tags, lifecycle pruning). Deploys are SHA-pinned: `deploy.yml`
+  pushes only `:${git-sha}` and registers a fresh task-def revision per deploy
+  (never re-pushes `:latest`, which an immutable repo would reject).
 - **GitHub OIDC deploy role** — least-privilege, trusts one repo+branch;
   consumed by `.github/workflows/deploy.yml`.
-- **CloudWatch alarms** — web/worker CPU + memory, ALB target 5xx.
+- **CloudWatch alarms** — web/worker CPU + memory, ALB target 5xx — all wired to
+  an **SNS topic** (subscribe on-call via `-c alarmEmail=...`).
 
 ## Prerequisites
 
@@ -54,6 +61,8 @@ env vars if not overridden.
 | `hostedZoneId`      | if `domainName` | Route53 public hosted zone id. |
 | `stage`             | no (`prod`) | Environment label (tags + HA toggles). |
 | `createOidcProvider`| no (`true`) | Set `false` if the account already has the GitHub OIDC provider (imports by ARN instead of creating). |
+| `alarmEmail`        | no       | Email subscribed to the alarm SNS topic. The address must confirm the subscription email SNS sends. |
+| `imageTag`          | no (`latest`) | ECR tag the CDK task defs bootstrap from. Steady-state deploys register SHA-pinned revisions; pass the SHA for a clean first bootstrap (`-c imageTag=<sha>`). |
 
 ## Deploy
 
@@ -92,21 +101,33 @@ npx cdk deploy \
    Actions secrets/vars (see `.github/workflows/deploy.yml` header):
    - secret `AWS_DEPLOY_ROLE_ARN` = `GitHubDeployRoleArn`
    - vars `ECR_REGISTRY`, `ECS_CLUSTER`, `ECS_WEB_SERVICE`, `ECS_WORKER_SERVICE`,
-     `ECS_MIGRATE_TASKDEF`, `ECS_MIGRATE_SUBNETS`, `ECS_MIGRATE_SECURITY_GROUPS`,
+     `ECS_MIGRATE_TASKDEF`, `ECS_MIGRATE_SUBNETS` (= output `MigrateSubnetIds`),
+     `ECS_MIGRATE_SECURITY_GROUPS` (= output `MigrateSecurityGroupId`),
      `AWS_REGION`, `NEXT_PUBLIC_APP_URL`.
+   - Sentry (optional; enables error reporting + source-map upload):
+     secrets `NEXT_PUBLIC_SENTRY_DSN`, `SENTRY_ORG`, `SENTRY_PROJECT`,
+     `SENTRY_AUTH_TOKEN`. The server-side `SENTRY_DSN` is read from the app
+     secret at runtime; put its value under the `SENTRY_DSN` key in step 1.
 
-3. **First images.** `deploy.yml` builds/pushes `web` + `worker`, runs the
-   migrate task, then rolls both services. The task defs reference the `:latest`
-   tag, so the very first deploy needs images present before the services reach
-   steady state.
+3. **First images / SHA-pinning.** `deploy.yml` gates on tests, builds/pushes
+   `web` + `worker` as immutable `:${git-sha}` images, runs the migrate task,
+   then registers a fresh task-def revision per service pinned to that SHA and
+   rolls both services. For the very first deploy the CDK task defs bootstrap
+   from `imageTag` (default `latest`); either push an initial `:latest` once or
+   `cdk deploy -c imageTag=<sha>` after the first image push.
+
+4. **Confirm the alarm SNS subscription.** If you passed `-c alarmEmail=...`,
+   AWS sends a confirmation email to that address — click confirm or the alarms
+   have no delivery target.
 
 ## Notes / non-goals
 
-- The ECS task defs reference `:latest`; `deploy.yml` also pushes an
-  immutable `:${{ github.sha }}` tag — pin the task defs to the SHA in a
-  hardening pass if you want fully immutable rollouts.
+- Rollouts are fully SHA-pinned: `deploy.yml` pushes only the immutable
+  `:${{ github.sha }}` tag and registers a new task-def revision per service
+  pinned to it. The CDK task defs only supply the bootstrap `imageTag`.
 - `ecs:*` and `iam:PassRole` on the deploy role are cluster-scoped via
   conditions; tighten to exact service ARNs when they stabilize.
-- Alarms have no SNS action wired — attach a topic/on-call integration.
+- Alarms publish to an SNS topic (`AlarmTopicArn` output). Subscribe on-call via
+  `-c alarmEmail=...` and confirm the subscription, or attach another integration.
 - Redis AUTH token is generated into Secrets Manager; construct it into
   `REDIS_URL` as shown above.

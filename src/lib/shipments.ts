@@ -99,7 +99,8 @@ export async function createShipment(input: {
       items: {
         select: {
           qty: true,
-          product: { select: { weightGrams: true } },
+          unitPriceInrPaise: true,
+          product: { select: { weightGrams: true, title: true, slug: true } },
         },
       },
     },
@@ -117,13 +118,48 @@ export async function createShipment(input: {
   }
   if (weightGrams <= 0) weightGrams = 500;
 
-  const addr = order.shippingAddress as { country?: string } | null;
-  const destinationCountry = addr?.country ?? "US";
+  // The shipping address is stored as JSON on the order; project it to the
+  // fields Shiprocket needs. See ShippingAddress in src/lib/orders.ts.
+  const addr = (order.shippingAddress ?? {}) as {
+    fullName?: string;
+    line1?: string;
+    line2?: string;
+    city?: string;
+    region?: string;
+    postalCode?: string;
+    country?: string;
+    phone?: string;
+  };
+  const destinationCountry = addr.country ?? "US";
+
+  // Build itemized line items + sub_total from real order data. Shiprocket is an
+  // India-based carrier, so selling_price/sub_total are sent in INR rupees
+  // (unitPriceInrPaise / 100). Currency + field names remain NEEDS-CONFIRMATION.
+  const orderItems = order.items.map((it) => ({
+    name: it.product.title,
+    sku: it.product.slug, // no dedicated SKU column; slug is the stable per-product key.
+    units: it.qty,
+    sellingPrice: it.unitPriceInrPaise / 100,
+  }));
+  const subTotal = order.items.reduce(
+    (sum, it) => sum + (it.qty * it.unitPriceInrPaise) / 100,
+    0,
+  );
 
   const sr = await shiprocketCreateShipment({
     orderId: order.id,
     weightGrams,
     destinationCountry,
+    buyerName: addr.fullName ?? "Customer",
+    email: order.buyer?.email ?? undefined,
+    phone: addr.phone,
+    addressLine1: addr.line1 ?? "",
+    addressLine2: addr.line2,
+    city: addr.city ?? "",
+    state: addr.region ?? "",
+    pincode: addr.postalCode ?? "",
+    orderItems,
+    subTotal,
   });
 
   const now = new Date();

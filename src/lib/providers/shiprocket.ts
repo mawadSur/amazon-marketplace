@@ -12,13 +12,14 @@
 //
 // Signature is stable and re-exported from "@/lib/stubs".
 //
-// REQUEST/RESPONSE MAPPING — NEEDS CONFIRMATION. Shiprocket's ad-hoc order
-// endpoint requires full billing/shipping addresses, itemized line items, and a
-// configured pickup location — none of which are in this function's input
-// contract (orderId, weightGrams, destinationCountry). The payload below uses
-// documented field names with placeholders for the missing data; see the
-// follow-up: createShipment() must be extended to pass real order/address/line
-// -item details before this is production-complete.
+// REQUEST/RESPONSE FIELD MAPPING — NEEDS CONFIRMATION. The ad-hoc order payload
+// below is now built from REAL order data (buyer, full shipping address,
+// itemized line items, sub_total) forwarded by createShipment(). The exact
+// Shiprocket field NAMES, the currency expected for selling_price/sub_total
+// (this code sends INR rupees, matching Shiprocket's India-based domestic
+// contract), and the pickup_location nickname (env.SHIPROCKET_PICKUP_LOCATION,
+// which must match a nickname configured in the Shiprocket dashboard) all still
+// need to be confirmed against the live API docs before go-live.
 
 import { env } from "@/lib/env";
 import { log } from "@/lib/log";
@@ -34,6 +35,38 @@ type ShipmentResult = {
   labelUrl: string;
   customsDocUrl: string;
   estimatedDelivery: Date;
+};
+
+/** One itemized line for the ad-hoc order payload. */
+export type ShiprocketOrderItem = {
+  name: string;
+  sku: string;
+  units: number;
+  /** Per-unit selling price in the carrier's currency (INR rupees). */
+  sellingPrice: number;
+};
+
+/**
+ * Real input contract for a Shiprocket ad-hoc order. createShipment() populates
+ * every field from the order + its shipping address + line items so the provider
+ * never has to fabricate a placeholder customer/address/sub_total.
+ */
+export type ShiprocketShipmentInput = {
+  orderId: string;
+  weightGrams: number;
+  destinationCountry: string;
+  // Buyer + shipping address (real order data).
+  buyerName: string;
+  email?: string;
+  phone?: string;
+  addressLine1: string;
+  addressLine2?: string;
+  city: string;
+  state: string;
+  pincode: string;
+  // Itemized line items + order subtotal (carrier currency, INR rupees).
+  orderItems: ShiprocketOrderItem[];
+  subTotal: number;
 };
 
 function hasCreds(): boolean {
@@ -81,14 +114,19 @@ async function api<T>(path: string, init: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
-export async function shiprocketCreateShipment(inp: {
-  orderId: string;
-  weightGrams: number;
-  destinationCountry: string;
-}): Promise<ShipmentResult> {
+export async function shiprocketCreateShipment(inp: ShiprocketShipmentInput): Promise<ShipmentResult> {
   if (hasCreds()) {
-    // 1) Create an ad-hoc order. Placeholder address/line-item fields flagged in
-    //    the header MUST be replaced with real order data (follow-up).
+    // 1) Create an ad-hoc order from REAL order data. Field NAMES + currency are
+    //    still NEEDS-CONFIRMATION (see header), but the values are no longer
+    //    placeholders: buyer, full shipping address, itemized line items, and
+    //    sub_total all come from createShipment().
+    //
+    // Split the buyer's full name into first/last as Shiprocket's ad-hoc order
+    // expects separate fields.
+    const nameParts = inp.buyerName.trim().split(/\s+/);
+    const firstName = nameParts[0] || "Customer";
+    const lastName = nameParts.length > 1 ? nameParts.slice(1).join(" ") : "";
+
     const order = await api<{ order_id: number; shipment_id: number }>(
       "/orders/create/adhoc",
       {
@@ -96,15 +134,28 @@ export async function shiprocketCreateShipment(inp: {
         body: JSON.stringify({
           order_id: inp.orderId,
           order_date: new Date().toISOString().slice(0, 10),
-          // TODO(confirm): pickup_location must match a configured Shiprocket
-          // pickup nickname; addresses + order_items need real order data.
-          pickup_location: "Primary",
-          billing_customer_name: "Customer",
+          // pickup_location must match a nickname configured in the Shiprocket
+          // dashboard (NEEDS-CONFIRMATION that "Primary" / this env value exists).
+          pickup_location: env.SHIPROCKET_PICKUP_LOCATION,
+          billing_customer_name: firstName,
+          billing_last_name: lastName,
+          billing_address: inp.addressLine1,
+          billing_address_2: inp.addressLine2 ?? "",
+          billing_city: inp.city,
+          billing_state: inp.state,
+          billing_pincode: inp.pincode,
           billing_country: inp.destinationCountry,
+          billing_email: inp.email ?? "",
+          billing_phone: inp.phone ?? "",
           shipping_is_billing: true,
-          order_items: [],
+          order_items: inp.orderItems.map((it) => ({
+            name: it.name,
+            sku: it.sku,
+            units: it.units,
+            selling_price: it.sellingPrice,
+          })),
           payment_method: "Prepaid",
-          sub_total: 0,
+          sub_total: inp.subTotal,
           length: 10,
           breadth: 10,
           height: 10,

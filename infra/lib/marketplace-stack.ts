@@ -2,7 +2,7 @@
 // values that deploy.yml / the human operator need.
 
 import { Construct } from "constructs";
-import { Stack, StackProps, CfnOutput } from "aws-cdk-lib";
+import { Stack, StackProps, CfnOutput, aws_ec2 as ec2 } from "aws-cdk-lib";
 import type { AppConfig } from "./config.js";
 import { Network } from "./network.js";
 import { Data } from "./data.js";
@@ -58,6 +58,18 @@ export class MarketplaceStack extends Stack {
     new CfnOutput(this, "EcsWebService", { value: compute.webService.serviceName });
     new CfnOutput(this, "EcsWorkerService", { value: compute.workerService.serviceName });
     new CfnOutput(this, "MigrateTaskDefArn", { value: compute.migrateTask.taskDefinitionArn });
+    // Wire these into deploy.yml's migrate job (vars ECS_MIGRATE_SUBNETS +
+    // ECS_MIGRATE_SECURITY_GROUPS) so `prisma migrate deploy` runs in-VPC and
+    // can reach RDS on 5432.
+    new CfnOutput(this, "MigrateSubnetIds", {
+      value: network.vpc.selectSubnets({
+        subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+      }).subnetIds.join(","),
+    });
+    new CfnOutput(this, "MigrateSecurityGroupId", {
+      value: compute.migrateSecurityGroup.securityGroupId,
+    });
+    new CfnOutput(this, "AlarmTopicArn", { value: compute.alarmTopic.topicArn });
     new CfnOutput(this, "AlbDnsName", { value: compute.alb.loadBalancerDnsName });
     new CfnOutput(this, "AppSecretArn", { value: data.appSecret.secretArn });
     new CfnOutput(this, "DbSecretArn", { value: data.dbSecret.secretArn });

@@ -75,6 +75,16 @@ export class Cicd extends Construct {
       }),
     );
 
+    // RegisterTaskDefinition has no resource-level scoping and no ecs:cluster
+    // condition key, so it needs its own unconditioned statement. deploy.yml
+    // registers a fresh SHA-pinned revision per service + the migrate task.
+    this.deployRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["ecs:RegisterTaskDefinition"],
+        resources: ["*"],
+      }),
+    );
+
     // PassRole so RunTask/UpdateService can hand the task/execution roles to ECS.
     this.deployRole.addToPolicy(
       new iam.PolicyStatement({

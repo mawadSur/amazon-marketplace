@@ -1,25 +1,35 @@
 name: Deploy
 
-# Build + push the web and worker images to ECR, run DB migrations as a
-# release step, then roll the two ECS Fargate services.
+# Gate on tests, build + push the web and worker images to ECR (immutable
+# :${sha} tags only), run DB migrations as a release step, then register new
+# SHA-pinned task-def revisions and roll the two ECS Fargate services.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # REQUIRES AWS SETUP (provisioned by the CDK app in ./infra):
-#   • An IAM role assumable via GitHub OIDC (see infra GitHubOidcRole output),
-#     set as the `AWS_DEPLOY_ROLE_ARN` repo secret/variable.
+#   • An IAM role assumable via GitHub OIDC (see infra GitHubDeployRoleArn),
+#     set as the `AWS_DEPLOY_ROLE_ARN` repo secret.
 #   • Two ECR repositories: `marketplace-web` and `marketplace-worker`.
 #   • An ECS cluster with services `web` and `worker` (names from CDK outputs).
-#   • A one-off "migrate" task definition (or run-task override) that runs
-#     `npx prisma migrate deploy` against the DB using DIRECT_URL from Secrets
-#     Manager. Migrations are intentionally NOT part of the image build.
+#   • A one-off "migrate" task definition that runs `npx prisma migrate deploy`
+#     against the DB using DIRECT_URL from Secrets Manager. Migrations are
+#     intentionally NOT part of the image build.
+#
+# Deploys are SHA-pinned: because the ECR repos are IMMUTABLE we push only the
+# `:${{ github.sha }}` tag (never re-push `:latest`), then register a fresh
+# task-def revision per service that references that exact digest tag and update
+# the service to it. This is idempotent across repeated deploys.
 #
 # All account-specific values are injected via GitHub Actions secrets/vars —
 # there are NO real account IDs committed here. Fill these in the repo settings
 # (Settings → Secrets and variables → Actions):
 #   secrets: AWS_DEPLOY_ROLE_ARN
+#            NEXT_PUBLIC_SENTRY_DSN, SENTRY_ORG, SENTRY_PROJECT,
+#            SENTRY_AUTH_TOKEN            (all optional; enable Sentry when set)
 #   vars:    AWS_REGION, ECR_REGISTRY, ECS_CLUSTER, ECS_WEB_SERVICE,
 #            ECS_WORKER_SERVICE, ECS_MIGRATE_TASKDEF, ECS_MIGRATE_SUBNETS,
-#            ECS_MIGRATE_SECURITY_GROUPS
+#            ECS_MIGRATE_SECURITY_GROUPS, NEXT_PUBLIC_APP_URL
+#   (ECS_MIGRATE_SUBNETS + ECS_MIGRATE_SECURITY_GROUPS come from the CDK
+#    outputs MigrateSubnetIds + MigrateSecurityGroupId.)
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -44,9 +54,35 @@ env:
   IMAGE_TAG: ${{ github.sha }}
 
 jobs:
+  # A red typecheck/test run must block the deploy — a failing build can never
+  # ship. Mirrors ci.yml's validation but is a hard `needs` gate for the deploy.
+  gate:
+    name: Gate · typecheck + test
+    runs-on: ubuntu-latest
+    env:
+      # Placeholder URL just satisfies env validation in src/lib/env.ts.
+      DATABASE_URL: postgresql://user:pass@localhost:5432/placeholder
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Generate Prisma client
+        run: npx prisma generate
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+
   build-and-push:
     name: Build & push images
     runs-on: ubuntu-latest
+    needs: gate
     outputs:
       image_tag: ${{ env.IMAGE_TAG }}
     steps:
@@ -64,7 +100,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Web image — Dockerfile.web (Next standalone server).
+      # Web image — Dockerfile.web (Next standalone server). Immutable :${sha}
+      # tag only; NEXT_PUBLIC_* + Sentry build-args are inlined into the bundle.
       - name: Build & push web image
         uses: docker/build-push-action@v6
         with:
@@ -73,13 +110,17 @@ jobs:
           push: true
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.WEB_REPO }}:${{ env.IMAGE_TAG }}
-            ${{ env.ECR_REGISTRY }}/${{ env.WEB_REPO }}:latest
           cache-from: type=gha,scope=web
           cache-to: type=gha,scope=web,mode=max
           build-args: |
             NEXT_PUBLIC_APP_URL=${{ vars.NEXT_PUBLIC_APP_URL }}
+            NEXT_PUBLIC_SENTRY_DSN=${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
+            SENTRY_ORG=${{ secrets.SENTRY_ORG }}
+            SENTRY_PROJECT=${{ secrets.SENTRY_PROJECT }}
+            SENTRY_AUTH_TOKEN=${{ secrets.SENTRY_AUTH_TOKEN }}
 
-      # Worker image — the existing ./Dockerfile (BullMQ worker).
+      # Worker image — the existing ./Dockerfile (BullMQ worker). Immutable
+      # :${sha} tag only.
       - name: Build & push worker image
         uses: docker/build-push-action@v6
         with:
@@ -88,7 +129,6 @@ jobs:
           push: true
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.WORKER_REPO }}:${{ env.IMAGE_TAG }}
-            ${{ env.ECR_REGISTRY }}/${{ env.WORKER_REPO }}:latest
           cache-from: type=gha,scope=worker
           cache-to: type=gha,scope=worker,mode=max
 
@@ -103,15 +143,29 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Runs `npx prisma migrate deploy` inside the cluster (the task def uses the
-      # worker image, which ships the prisma CLI + schema, and reads DIRECT_URL
-      # from Secrets Manager). We wait for the task to stop and assert exit 0.
+      # Register a SHA-pinned migrate revision (base task def with the worker
+      # :${sha} image) and run it in-VPC. The migrate SG (CDK output
+      # MigrateSecurityGroupId) can reach RDS on 5432; DIRECT_URL comes from
+      # Secrets Manager. We wait for the task to stop and assert exit 0.
       - name: Run prisma migrate deploy
         run: |
           set -euo pipefail
+          WORKER_IMAGE="${ECR_REGISTRY}/${WORKER_REPO}:${IMAGE_TAG}"
+          aws ecs describe-task-definition \
+            --task-definition "${{ vars.ECS_MIGRATE_TASKDEF }}" \
+            --query 'taskDefinition' --output json > base-migrate-td.json
+          jq --arg IMG "$WORKER_IMAGE" '
+            .containerDefinitions[0].image = $IMG
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .compatibilities, .registeredAt, .registeredBy)
+          ' base-migrate-td.json > migrate-td.json
+          MIGRATE_TD=$(aws ecs register-task-definition \
+            --cli-input-json file://migrate-td.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "Registered migrate task def: $MIGRATE_TD"
           TASK_ARN=$(aws ecs run-task \
             --cluster "${{ vars.ECS_CLUSTER }}" \
-            --task-definition "${{ vars.ECS_MIGRATE_TASKDEF }}" \
+            --task-definition "$MIGRATE_TD" \
             --launch-type FARGATE \
             --network-configuration "awsvpcConfiguration={subnets=[${{ vars.ECS_MIGRATE_SUBNETS }}],securityGroups=[${{ vars.ECS_MIGRATE_SECURITY_GROUPS }}],assignPublicIp=DISABLED}" \
             --overrides '{"containerOverrides":[{"name":"migrate","command":["npx","prisma","migrate","deploy"]}]}' \
@@ -134,22 +188,40 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Force a new deployment; the services' task defs reference the `:latest`
-      # (or pinned SHA) tag we just pushed. --wait-for-service-stability below
-      # blocks until the rollout is healthy so a bad image fails the workflow.
-      - name: Update web service
+      # For each service: take its current task def, swap the container image to
+      # the immutable :${sha} we just pushed, register a new revision, and point
+      # the service at it. SHA-pinning means every deploy pulls the exact image
+      # (no reliance on a mutable :latest tag, which an IMMUTABLE ECR rejects).
+      - name: Register SHA-pinned revisions and update services
         run: |
-          aws ecs update-service \
-            --cluster "${{ vars.ECS_CLUSTER }}" \
-            --service "${{ vars.ECS_WEB_SERVICE }}" \
-            --force-new-deployment
-
-      - name: Update worker service
-        run: |
-          aws ecs update-service \
-            --cluster "${{ vars.ECS_CLUSTER }}" \
-            --service "${{ vars.ECS_WORKER_SERVICE }}" \
-            --force-new-deployment
+          set -euo pipefail
+          roll() {
+            local svc="$1" repo="$2"
+            local image="${ECR_REGISTRY}/${repo}:${IMAGE_TAG}"
+            local current
+            current=$(aws ecs describe-services \
+              --cluster "${{ vars.ECS_CLUSTER }}" --services "$svc" \
+              --query 'services[0].taskDefinition' --output text)
+            echo "$svc current task def: $current"
+            aws ecs describe-task-definition --task-definition "$current" \
+              --query 'taskDefinition' --output json > "base-$svc-td.json"
+            jq --arg IMG "$image" '
+              .containerDefinitions[0].image = $IMG
+              | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                    .compatibilities, .registeredAt, .registeredBy)
+            ' "base-$svc-td.json" > "$svc-td.json"
+            local new
+            new=$(aws ecs register-task-definition \
+              --cli-input-json "file://$svc-td.json" \
+              --query 'taskDefinition.taskDefinitionArn' --output text)
+            echo "$svc new task def: $new"
+            aws ecs update-service \
+              --cluster "${{ vars.ECS_CLUSTER }}" \
+              --service "$svc" \
+              --task-definition "$new"
+          }
+          roll "${{ vars.ECS_WEB_SERVICE }}" "$WEB_REPO"
+          roll "${{ vars.ECS_WORKER_SERVICE }}" "$WORKER_REPO"
 
       - name: Wait for services to stabilize
         run: |
