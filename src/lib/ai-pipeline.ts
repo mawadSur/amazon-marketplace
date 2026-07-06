@@ -73,10 +73,16 @@ export async function startPipeline(input: PipelineInput) {
   for (const job of jobs) {
     if (DEFERRED_KINDS.has(job.kind)) continue;
     const queueName = QUEUE_FOR[job.kind as keyof typeof QUEUE_FOR];
-    await getQueue(queueName).add(job.kind, {
-      aiJobId: job.id,
-      productId: input.productId,
-    });
+    await getQueue(queueName).add(
+      job.kind,
+      { aiJobId: job.id, productId: input.productId },
+      {
+        attempts: 3,
+        backoff: { type: "exponential", delay: 5_000 },
+        removeOnComplete: { age: 24 * 3600, count: 1000 },
+        removeOnFail: false, // keep failed jobs for admin inspection
+      },
+    );
   }
 
   return jobs;
@@ -104,7 +110,12 @@ export async function enqueueAvatarVideo(productId: string) {
   await getQueue("ai.avatar_video").add(
     "AVATAR_VIDEO",
     { aiJobId: job.id, productId },
-    { attempts: 2, backoff: { type: "exponential", delay: 10_000 }, removeOnComplete: { age: 86_400 } },
+    {
+      attempts: 2,
+      backoff: { type: "exponential", delay: 10_000 },
+      removeOnComplete: { age: 86_400, count: 1000 },
+      removeOnFail: false, // keep failed renders for admin inspection
+    },
   );
 }
 
@@ -117,8 +128,14 @@ export async function enqueueAfterCategorize(productId: string) {
     where: { productId, kind: "CATEGORIZATION", status: "QUEUED" },
   });
   if (!job) return;
-  await getQueue("ai.categorization").add("CATEGORIZATION", {
-    aiJobId: job.id,
-    productId,
-  });
+  await getQueue("ai.categorization").add(
+    "CATEGORIZATION",
+    { aiJobId: job.id, productId },
+    {
+      attempts: 3,
+      backoff: { type: "exponential", delay: 5_000 },
+      removeOnComplete: { age: 24 * 3600, count: 1000 },
+      removeOnFail: false, // keep failed jobs for admin inspection
+    },
+  );
 }

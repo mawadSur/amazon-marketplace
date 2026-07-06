@@ -4,7 +4,8 @@
 
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
-import { FX_USD_TO_INR, usdCentsToInrPaise } from "@/lib/stubs";
+import { FX_USD_TO_INR } from "@/lib/stubs";
+import { usdCentsToInrPaiseAt } from "@/lib/fx";
 import { estimateLanded } from "@/lib/customs";
 
 export type ShippingAddress = {
@@ -106,7 +107,9 @@ export async function createOrderFromCart(
             shopId: it.product.shopId,
             qty: it.qty,
             unitPriceUsdCents: it.product.priceUsdCents,
-            unitPriceInrPaise: usdCentsToInrPaise(it.product.priceUsdCents),
+            // Snapshot INR at the order's resolved fxRate so payouts settle at
+            // the rate the buyer was quoted (not a later static rate).
+            unitPriceInrPaise: usdCentsToInrPaiseAt(it.product.priceUsdCents, fxRate),
           })),
         },
         payment: {

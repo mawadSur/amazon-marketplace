@@ -4,6 +4,7 @@
 // Returns { orderId, checkoutUrl } so the client can redirect.
 
 import { NextResponse } from "next/server";
+import * as Sentry from "@sentry/nextjs";
 import { z } from "zod";
 import { auth } from "@/lib/auth";
 import { createOrderFromCart } from "@/lib/orders";
@@ -65,16 +66,24 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: msg }, { status });
   }
 
-  const checkout = await stripeCreateCheckout({
-    orderId: order.orderId,
-    amountUsdCents: order.totalUsdCents,
-  });
+  // Money path: a Stripe/DB failure here must surface (and alert) rather than
+  // leaving the buyer on a dead redirect. The Order already exists (PLACED), so
+  // it can be retried from the cart.
+  try {
+    const checkout = await stripeCreateCheckout({
+      orderId: order.orderId,
+      amountUsdCents: order.totalUsdCents,
+    });
 
-  // Persist the intent id on the Payment row for later reconciliation.
-  await prisma.payment.update({
-    where: { orderId: order.orderId },
-    data: { providerIntentId: checkout.intentId },
-  });
+    // Persist the intent id on the Payment row for later reconciliation.
+    await prisma.payment.update({
+      where: { orderId: order.orderId },
+      data: { providerIntentId: checkout.intentId },
+    });
 
-  return NextResponse.json({ orderId: order.orderId, checkoutUrl: checkout.url });
+    return NextResponse.json({ orderId: order.orderId, checkoutUrl: checkout.url });
+  } catch (err) {
+    Sentry.captureException(err, { extra: { route: "api/checkout", orderId: order.orderId } });
+    return NextResponse.json({ error: "CHECKOUT_INIT_FAILED", orderId: order.orderId }, { status: 502 });
+  }
 }

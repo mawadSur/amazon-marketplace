@@ -55,6 +55,23 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "PRODUCT_NOT_FOUND" }, { status: 404 });
   }
 
+  // Verified-purchase gate: the buyer must have a delivered/completed order that
+  // contains an item from this product's shop. OrderItem.shopId is denormalized,
+  // so this is a single indexed lookup.
+  const purchase = await prisma.orderItem.findFirst({
+    where: {
+      shopId: product.shopId,
+      order: {
+        buyerId: session.user.id,
+        status: { in: ["DELIVERED", "COMPLETED"] },
+      },
+    },
+    select: { id: true },
+  });
+  if (!purchase) {
+    return NextResponse.json({ error: "PURCHASE_REQUIRED" }, { status: 403 });
+  }
+
   const review = await prisma.review.upsert({
     where: { productId_buyerId: { productId, buyerId: session.user.id } },
     update: { rating, body: body ?? null },

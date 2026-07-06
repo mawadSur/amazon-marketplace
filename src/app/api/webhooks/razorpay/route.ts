@@ -1,17 +1,17 @@
 // POST /api/webhooks/razorpay
 //
-// Two modes, gated on env.RAZORPAY_WEBHOOK_SECRET:
+// REAL MODE (env.RAZORPAY_WEBHOOK_SECRET set): verifies the X-Razorpay-Signature
+// HMAC-SHA256 of the RAW body against the configured secret using a
+// constant-time compare, then dispatches payout.processed / payout.failed /
+// payout.reversed to markPayoutPaid / markPayoutFailed.
 //
-// REAL MODE: verifies the X-Razorpay-Signature HMAC-SHA256 of the raw body
-// against the configured secret using a constant-time compare. Parses the
-// event and dispatches payout.processed / payout.failed / payout.reversed
-// to markPayoutPaid / markPayoutFailed.
-//
-// STUB MODE (dev): "Mark payout paid" button on /seller/payouts (admin-only)
-// POSTs `{ payoutId | razorpayPayoutId, status }` directly. No signature.
+// FAIL-CLOSED: when the signing secret is unset we NEVER accept an anonymous
+// payout status change in production (env.ts already requires the secret in
+// prod). Only in dev/test does the admin "Mark payout paid" button POST directly.
 
 import { NextResponse } from "next/server";
 import crypto from "node:crypto";
+import * as Sentry from "@sentry/nextjs";
 import { z } from "zod";
 import { env } from "@/lib/env";
 import { markPayoutPaid, markPayoutFailed } from "@/lib/payouts";
@@ -77,13 +77,23 @@ export async function POST(req: Request) {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "ERROR";
       const status = msg === "PAYOUT_NOT_FOUND" ? 404 : 500;
+      if (status >= 500) {
+        Sentry.captureException(err, { extra: { route: "webhooks/razorpay", razorpayPayoutId, eventType } });
+      }
       return NextResponse.json({ error: msg }, { status });
     }
 
     return NextResponse.json({ ok: true, received: eventType });
   }
 
-  // ───── STUB MODE ─────
+  // ───── NO SIGNING SECRET ─────
+  // Fail closed in production — an unauthenticated payout status change must
+  // never run.
+  if (env.NODE_ENV === "production") {
+    return NextResponse.json({ error: "WEBHOOK_NOT_CONFIGURED" }, { status: 500 });
+  }
+
+  // ───── DEV STUB MODE ─────
   let json: unknown;
   try {
     json = JSON.parse(rawBody);
@@ -111,6 +121,9 @@ export async function POST(req: Request) {
   } catch (err) {
     const msg = err instanceof Error ? err.message : "ERROR";
     const status = msg === "PAYOUT_NOT_FOUND" ? 404 : 500;
+    if (status >= 500) {
+      Sentry.captureException(err, { extra: { route: "webhooks/razorpay (dev stub)" } });
+    }
     return NextResponse.json({ error: msg }, { status });
   }
 

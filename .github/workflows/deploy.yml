@@ -1,0 +1,158 @@
+name: Deploy
+
+# Build + push the web and worker images to ECR, run DB migrations as a
+# release step, then roll the two ECS Fargate services.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# REQUIRES AWS SETUP (provisioned by the CDK app in ./infra):
+#   • An IAM role assumable via GitHub OIDC (see infra GitHubOidcRole output),
+#     set as the `AWS_DEPLOY_ROLE_ARN` repo secret/variable.
+#   • Two ECR repositories: `marketplace-web` and `marketplace-worker`.
+#   • An ECS cluster with services `web` and `worker` (names from CDK outputs).
+#   • A one-off "migrate" task definition (or run-task override) that runs
+#     `npx prisma migrate deploy` against the DB using DIRECT_URL from Secrets
+#     Manager. Migrations are intentionally NOT part of the image build.
+#
+# All account-specific values are injected via GitHub Actions secrets/vars —
+# there are NO real account IDs committed here. Fill these in the repo settings
+# (Settings → Secrets and variables → Actions):
+#   secrets: AWS_DEPLOY_ROLE_ARN
+#   vars:    AWS_REGION, ECR_REGISTRY, ECS_CLUSTER, ECS_WEB_SERVICE,
+#            ECS_WORKER_SERVICE, ECS_MIGRATE_TASKDEF, ECS_MIGRATE_SUBNETS,
+#            ECS_MIGRATE_SECURITY_GROUPS
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+# OIDC: mint short-lived AWS creds, no long-lived access keys.
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+  WEB_REPO: marketplace-web
+  WORKER_REPO: marketplace-worker
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-push:
+    name: Build & push images
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ env.IMAGE_TAG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Web image — Dockerfile.web (Next standalone server).
+      - name: Build & push web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.web
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.WEB_REPO }}:${{ env.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/${{ env.WEB_REPO }}:latest
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,scope=web,mode=max
+          build-args: |
+            NEXT_PUBLIC_APP_URL=${{ vars.NEXT_PUBLIC_APP_URL }}
+
+      # Worker image — the existing ./Dockerfile (BullMQ worker).
+      - name: Build & push worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.WORKER_REPO }}:${{ env.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/${{ env.WORKER_REPO }}:latest
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,scope=worker,mode=max
+
+  migrate:
+    name: DB migrate (release step)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Runs `npx prisma migrate deploy` inside the cluster (the task def uses the
+      # worker image, which ships the prisma CLI + schema, and reads DIRECT_URL
+      # from Secrets Manager). We wait for the task to stop and assert exit 0.
+      - name: Run prisma migrate deploy
+        run: |
+          set -euo pipefail
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "${{ vars.ECS_CLUSTER }}" \
+            --task-definition "${{ vars.ECS_MIGRATE_TASKDEF }}" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ vars.ECS_MIGRATE_SUBNETS }}],securityGroups=[${{ vars.ECS_MIGRATE_SECURITY_GROUPS }}],assignPublicIp=DISABLED}" \
+            --overrides '{"containerOverrides":[{"name":"migrate","command":["npx","prisma","migrate","deploy"]}]}' \
+            --query 'tasks[0].taskArn' --output text)
+          echo "Started migrate task: $TASK_ARN"
+          aws ecs wait tasks-stopped --cluster "${{ vars.ECS_CLUSTER }}" --tasks "$TASK_ARN"
+          EXIT=$(aws ecs describe-tasks --cluster "${{ vars.ECS_CLUSTER }}" --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+          echo "migrate task exit code: $EXIT"
+          test "$EXIT" = "0"
+
+  deploy:
+    name: Roll ECS services
+    runs-on: ubuntu-latest
+    needs: [build-and-push, migrate]
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Force a new deployment; the services' task defs reference the `:latest`
+      # (or pinned SHA) tag we just pushed. --wait-for-service-stability below
+      # blocks until the rollout is healthy so a bad image fails the workflow.
+      - name: Update web service
+        run: |
+          aws ecs update-service \
+            --cluster "${{ vars.ECS_CLUSTER }}" \
+            --service "${{ vars.ECS_WEB_SERVICE }}" \
+            --force-new-deployment
+
+      - name: Update worker service
+        run: |
+          aws ecs update-service \
+            --cluster "${{ vars.ECS_CLUSTER }}" \
+            --service "${{ vars.ECS_WORKER_SERVICE }}" \
+            --force-new-deployment
+
+      - name: Wait for services to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ vars.ECS_CLUSTER }}" \
+            --services "${{ vars.ECS_WEB_SERVICE }}" "${{ vars.ECS_WORKER_SERVICE }}"

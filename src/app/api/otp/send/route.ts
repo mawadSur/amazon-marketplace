@@ -45,6 +45,12 @@ export async function POST(req: Request) {
     );
   }
 
-  const result = await sendOtp(parsed.data.phone);
-  return NextResponse.json(result);
+  try {
+    const result = await sendOtp(parsed.data.phone);
+    return NextResponse.json(result);
+  } catch {
+    // sendOtp fails closed when the SMS provider is unconfigured, and can also
+    // surface transient provider errors. Never leak internals to the client.
+    return NextResponse.json({ error: "OTP_UNAVAILABLE" }, { status: 503 });
+  }
 }

@@ -2,6 +2,7 @@
 // Body: { outcome: "BUYER" | "SELLER", resolution: string }
 
 import { NextResponse } from "next/server";
+import * as Sentry from "@sentry/nextjs";
 import { z } from "zod";
 import { requireRole } from "@/lib/auth";
 import { resolveDispute } from "@/lib/disputes";
@@ -53,6 +54,10 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
           : msg === "RESOLUTION_REQUIRED"
             ? 400
             : 500;
+    // Dispute resolution moves money (refund + payout clawback) — alert on 5xx.
+    if (status >= 500) {
+      Sentry.captureException(err, { extra: { route: "admin/disputes/resolve", disputeId: id } });
+    }
     return NextResponse.json({ error: msg }, { status });
   }
 }

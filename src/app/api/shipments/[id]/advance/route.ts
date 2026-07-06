@@ -59,7 +59,8 @@ export async function POST(
     return NextResponse.json({ shipment: updated });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "ERROR";
-    const status = msg === "SHIPMENT_NOT_FOUND" ? 404 : 400;
+    const status =
+      msg === "SHIPMENT_NOT_FOUND" ? 404 : msg === "SIMULATION_DISABLED" ? 403 : 400;
     return NextResponse.json({ error: msg }, { status });
   }
 }

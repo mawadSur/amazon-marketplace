@@ -6,8 +6,11 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  // Pooled connection (may carry ?connection_limit=..&pgbouncer=true) for the app.
+  url       = env("DATABASE_URL")
+  // Direct (non-pooled) connection used by `prisma migrate`/introspection.
+  directUrl = env("DIRECT_URL")
 }
 
 // ============================================================================
@@ -260,6 +263,7 @@ model Category {
   children Category[] @relation("Subcategories")
   products Product[]
 
+  @@index([parentId])
   @@map("categories")
 }
 
@@ -309,6 +313,7 @@ model Product {
 
   @@index([status, publishedAt])
   @@index([shopId, status])
+  @@index([categoryId])
   @@map("products")
 }
 
@@ -437,6 +442,7 @@ enum PayoutStatus {
   PROCESSING
   PAID
   FAILED
+  REVERSED
 }
 
 model Order {
@@ -482,6 +488,8 @@ model OrderItem {
   product Product @relation(fields: [productId], references: [id])
 
   @@index([shopId])
+  @@index([orderId])
+  @@index([productId])
   @@map("order_items")
 }
 
@@ -505,6 +513,10 @@ model Payment {
 model Payout {
   id                String       @id @default(cuid())
   shopId            String       @map("shop_id")
+  /// Source order this payout settles. Nullable for legacy rows; combined with
+  /// shopId it enforces one payout per (order, shop) so re-enqueues can't
+  /// double-pay a seller.
+  orderId           String?      @map("order_id")
   razorpayPayoutId  String?      @unique @map("razorpay_payout_id")
   status            PayoutStatus @default(PENDING)
   amountInrPaise    Int          @map("amount_inr_paise")
@@ -512,11 +524,46 @@ model Payout {
   createdAt         DateTime     @default(now()) @map("created_at")
   paidAt            DateTime?    @map("paid_at")
   failureReason     String?      @map("failure_reason") @db.Text
+  /// Clawback tracking (D4): set when a captured payout is reversed after a
+  /// refund/dispute. reversalId is the gateway reversal reference.
+  reversedAt        DateTime?    @map("reversed_at")
+  reversalId        String?      @map("reversal_id")
 
-  shop Shop @relation(fields: [shopId], references: [id])
+  shop      Shop             @relation(fields: [shopId], references: [id])
+  reversals PayoutReversal[]
 
+  @@unique([orderId, shopId])
   @@index([shopId, status])
   @@map("payouts")
+}
+
+/// Ledger of payout clawbacks. One payout may be partially/fully reversed once a
+/// refund or lost dispute requires recovering funds already sent to a seller.
+model PayoutReversal {
+  id             String   @id @default(cuid())
+  payoutId       String   @map("payout_id")
+  amountInrPaise Int      @map("amount_inr_paise")
+  reason         String?  @db.Text
+  reversalRef    String?  @map("reversal_ref") // gateway reversal / debit id
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  payout Payout @relation(fields: [payoutId], references: [id], onDelete: Cascade)
+
+  @@index([payoutId])
+  @@map("payout_reversals")
+}
+
+/// Webhook idempotency ledger. The provider's event id is the primary key, so a
+/// replayed Stripe/Razorpay event is a duplicate-insert no-op and payment
+/// capture never runs twice for the same event.
+model ProcessedWebhookEvent {
+  id         String   @id // provider event id (e.g. Stripe evt_..., Razorpay event id)
+  provider   String   // "stripe" | "razorpay"
+  orderId    String?  @map("order_id")
+  receivedAt DateTime @default(now()) @map("received_at")
+
+  @@index([orderId])
+  @@map("processed_webhook_events")
 }
 
 // ============================================================================

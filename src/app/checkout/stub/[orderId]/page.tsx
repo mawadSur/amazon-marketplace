@@ -3,7 +3,7 @@
 // the stub URL points here so the local dev flow works. The Pay-now button
 // POSTs to /api/webhooks/stripe to simulate capture.
 
-import { redirect } from "next/navigation";
+import { redirect, notFound } from "next/navigation";
 import Link from "next/link";
 import { MarketplaceNav } from "@/components/buyer/marketplace-nav";
 import { auth } from "@/lib/auth";
@@ -18,6 +18,10 @@ export default async function StripeStubPage({
 }: {
   params: Promise<{ orderId: string }>;
 }) {
+  // Dev-only surface: in production real Stripe Checkout replaces this page, so
+  // it must never be reachable (it simulates payment capture without a card).
+  if (process.env.NODE_ENV === "production") notFound();
+
   const { orderId } = await params;
   const session = await auth();
   if (!session?.user?.id) {

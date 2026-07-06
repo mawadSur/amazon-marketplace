@@ -1,0 +1,56 @@
+# Dockerfile.web — Next.js web app image (the standalone server).
+#
+# The existing ./Dockerfile builds the BullMQ *worker* image; this one builds
+# the *web* image that serves HTTP. It relies on `output: "standalone"` in
+# next.config.ts, which emits a self-contained server at
+# .next/standalone/server.js plus a minimal node_modules subset.
+#
+# Build:  docker build -f Dockerfile.web -t marketplace-web .
+# Run:    docker run --rm -p 3000:3000 --env-file .env marketplace-web
+
+FROM node:22-alpine AS base
+RUN apk add --no-cache libc6-compat openssl
+WORKDIR /app
+
+# --- deps ----------------------------------------------------------------
+FROM base AS deps
+COPY package.json package-lock.json ./
+COPY prisma ./prisma
+RUN npm ci --no-audit --no-fund
+
+# --- build ---------------------------------------------------------------
+FROM base AS build
+ENV NEXT_TELEMETRY_DISABLED=1
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+# `npm run build` runs `prisma generate && next build`. A placeholder
+# DATABASE_URL satisfies env validation; pages are force-dynamic so nothing
+# queries the DB at build time. NEXT_PUBLIC_* build-time values should be
+# passed via --build-arg in CI when they must be inlined into the client bundle.
+ARG NEXT_PUBLIC_APP_URL=http://localhost:3000
+ENV NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}
+ENV DATABASE_URL=postgresql://user:pass@localhost:5432/placeholder
+RUN npm run build
+
+# --- runtime -------------------------------------------------------------
+FROM base AS runtime
+ENV NODE_ENV=production
+ENV NODE_OPTIONS="--enable-source-maps"
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
+
+# Non-root user.
+RUN addgroup --system --gid 1001 nodejs \
+  && adduser --system --uid 1001 nextjs
+
+# Standalone output bundles a trimmed node_modules + server.js.
+COPY --from=build --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=build --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --from=build --chown=nextjs:nodejs /app/public ./public
+
+USER nextjs
+
+EXPOSE 3000
+
+# server.js is the standalone entrypoint emitted by Next.
+CMD ["node", "server.js"]

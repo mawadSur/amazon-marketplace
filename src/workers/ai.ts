@@ -17,6 +17,9 @@ import * as Sentry from "@sentry/node";
 import type { AiJob, Product } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { makeWorker, type QueueName } from "@/lib/queue";
+import { log } from "@/lib/log";
+
+const wlog = log.child({ module: "worker" });
 
 if (process.env.SENTRY_DSN) {
   Sentry.init({
@@ -341,36 +344,92 @@ const queueNames: QueueName[] = [
 const byQueue = new Map(workers.map((w) => [w.name, w]));
 
 // Description finishing triggers categorization (sequential dependency).
+// The hook is wrapped so a throw here (e.g. a transient DB blip) can't take
+// down the worker process — a failed enqueue is logged and reported, not fatal.
 byQueue.get("ai.description")?.on("completed", async (job) => {
-  const payload = job.data as AiJobPayload;
-  await enqueueAfterCategorize(payload.productId);
+  try {
+    const payload = job.data as AiJobPayload;
+    await enqueueAfterCategorize(payload.productId);
+  } catch (err) {
+    wlog.error({ err, jobId: job?.id }, "enqueueAfterCategorize hook failed");
+    if (process.env.SENTRY_DSN) Sentry.captureException(err, { tags: { hook: "afterCategorize" } });
+  }
 });
 
 // Background removal finishing triggers avatar-video generation (the clean
 // cutout is the best input). Works in stub mode too — the BG stub still fires.
 byQueue.get("ai.background_removal")?.on("completed", async (job) => {
-  const payload = job.data as AiJobPayload;
-  await enqueueAvatarVideo(payload.productId);
+  try {
+    const payload = job.data as AiJobPayload;
+    await enqueueAvatarVideo(payload.productId);
+  } catch (err) {
+    wlog.error({ err, jobId: job?.id }, "enqueueAvatarVideo hook failed");
+    if (process.env.SENTRY_DSN) Sentry.captureException(err, { tags: { hook: "avatarVideo" } });
+  }
 });
 
 for (const w of workers) {
   w.on("failed", (job, err) => {
-    console.error(`[worker] ${w.name} job ${job?.id} failed:`, err.message);
+    wlog.error({ err, queue: w.name, jobId: job?.id }, "job failed");
     if (process.env.SENTRY_DSN) {
       Sentry.captureException(err, {
         tags: { queue: w.name, jobId: job?.id ?? "unknown" },
       });
     }
   });
+  // Redis/worker-level errors (not tied to a single job) — surface them too.
+  w.on("error", (err) => {
+    wlog.error({ err, queue: w.name }, "worker error");
+    if (process.env.SENTRY_DSN) Sentry.captureException(err, { tags: { queue: w.name } });
+  });
 }
 
-console.log(`[worker] listening on: ${queueNames.join(", ")}`);
+wlog.info({ queues: queueNames }, "worker listening");
 
-async function shutdown() {
-  console.log("[worker] shutting down...");
-  await Promise.all(workers.map((w) => w.close()));
-  process.exit(0);
+// ---------------------------------------------------------------- lifecycle
+
+let shuttingDown = false;
+const SHUTDOWN_TIMEOUT_MS = 25_000;
+
+async function shutdown(signal: string) {
+  if (shuttingDown) return; // ignore repeated signals
+  shuttingDown = true;
+  wlog.info({ signal }, "shutting down");
+
+  // Bounded graceful drain: give in-flight jobs a chance to finish, but never
+  // hang the process (ALB/K8s will SIGKILL after its own grace period anyway).
+  const timer = setTimeout(() => {
+    wlog.error({ timeoutMs: SHUTDOWN_TIMEOUT_MS }, "graceful shutdown timed out; forcing exit");
+    void Sentry.flush(2_000).finally(() => process.exit(1));
+  }, SHUTDOWN_TIMEOUT_MS);
+  timer.unref();
+
+  try {
+    await Promise.all(workers.map((w) => w.close()));
+    await Sentry.flush(2_000);
+    clearTimeout(timer);
+    process.exit(0);
+  } catch (err) {
+    wlog.error({ err }, "error during shutdown");
+    await Sentry.flush(2_000).catch(() => {});
+    clearTimeout(timer);
+    process.exit(1);
+  }
 }
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+// Last-resort process guards. A crash here should be reported to Sentry and
+// flushed before we exit — a silent worker death loses observability.
+process.on("unhandledRejection", (reason) => {
+  wlog.error({ err: reason }, "unhandledRejection");
+  if (process.env.SENTRY_DSN) Sentry.captureException(reason);
+  void Sentry.flush(2_000).finally(() => process.exit(1));
+});
+
+process.on("uncaughtException", (err) => {
+  wlog.error({ err }, "uncaughtException");
+  if (process.env.SENTRY_DSN) Sentry.captureException(err);
+  void Sentry.flush(2_000).finally(() => process.exit(1));
+});

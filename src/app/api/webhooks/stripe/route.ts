@@ -1,19 +1,20 @@
 // POST /api/webhooks/stripe
 //
-// Two modes, gated on env.STRIPE_WEBHOOK_SECRET:
+// REAL MODE (env.STRIPE_WEBHOOK_SECRET set): verifies the Stripe signature
+// header against the RAW body, parses the event via
+// `stripe.webhooks.constructEvent`, and dispatches checkout.session.completed to
+// markPaymentCaptured (passing the event id for idempotency + the captured
+// amount/currency for verification). Other event types are acknowledged with 200.
 //
-// REAL MODE: verifies the Stripe signature header, parses the event via
-// `stripe.webhooks.constructEvent`, and dispatches checkout.session.completed
-// to markPaymentCaptured. Any other event types are acknowledged with 200 so
-// Stripe doesn't retry them.
-//
-// STUB MODE (dev): the stub Pay-now page POSTs `{ orderId }` directly. No
-// signature required. This path stays so the local demo works without keys.
+// FAIL-CLOSED: when the signing secret is unset we NEVER accept an anonymous
+// body-driven capture in production (env.ts already requires the secret in
+// prod). Only in dev/test does the local stub Pay-now page POST `{ orderId }`.
 //
 // Raw body is read ONCE at the top — req.text()/req.json() can't both run.
 
 import { NextResponse } from "next/server";
 import Stripe from "stripe";
+import * as Sentry from "@sentry/nextjs";
 import { z } from "zod";
 import { env } from "@/lib/env";
 import { markPaymentCaptured } from "@/lib/payments";
@@ -57,12 +58,20 @@ export async function POST(req: Request) {
       try {
         await markPaymentCaptured({
           orderId,
+          eventId: event.id,
+          provider: "stripe",
           providerChargeId:
             typeof session.payment_intent === "string" ? session.payment_intent : undefined,
+          capturedAmountUsdCents:
+            typeof session.amount_total === "number" ? session.amount_total : undefined,
+          capturedCurrency: session.currency ?? undefined,
         });
       } catch (err) {
         const msg = err instanceof Error ? err.message : "ERROR";
         const status = msg === "ORDER_NOT_FOUND" ? 404 : 500;
+        if (status >= 500) {
+          Sentry.captureException(err, { extra: { route: "webhooks/stripe", orderId, eventId: event.id } });
+        }
         return NextResponse.json({ error: msg }, { status });
       }
     }
@@ -70,7 +79,13 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true, received: event.type });
   }
 
-  // ───── STUB MODE ─────
+  // ───── NO SIGNING SECRET ─────
+  // Fail closed in production — an unauthenticated capture must never run.
+  if (env.NODE_ENV === "production") {
+    return NextResponse.json({ error: "WEBHOOK_NOT_CONFIGURED" }, { status: 500 });
+  }
+
+  // ───── DEV STUB MODE ─────
   let json: unknown;
   try {
     json = JSON.parse(rawBody);
@@ -85,11 +100,15 @@ export async function POST(req: Request) {
   try {
     await markPaymentCaptured({
       orderId: parsed.data.orderId,
+      provider: "stripe",
       providerChargeId: parsed.data.providerChargeId ?? `ch_stub_${parsed.data.orderId}`,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "ERROR";
     const status = msg === "ORDER_NOT_FOUND" ? 404 : 500;
+    if (status >= 500) {
+      Sentry.captureException(err, { extra: { route: "webhooks/stripe (dev stub)", orderId: parsed.data.orderId } });
+    }
     return NextResponse.json({ error: msg }, { status });
   }
 

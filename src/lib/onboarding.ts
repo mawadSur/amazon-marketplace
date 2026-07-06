@@ -150,11 +150,18 @@ export async function submitKyc(formData: FormData): Promise<ActionResult> {
     return { ok: false, error: "Please fix the highlighted fields.", fieldErrors: fieldErrorsFromZod(parsed.error) };
   }
 
-  const result = await verifyKyc({
-    gstNumber: parsed.data.gstNumber || undefined,
-    panNumber: parsed.data.panNumber || undefined,
-    udyamNumber: parsed.data.udyamNumber || undefined,
-  });
+  let result: { verified: boolean; reason?: string };
+  try {
+    result = await verifyKyc({
+      gstNumber: parsed.data.gstNumber || undefined,
+      panNumber: parsed.data.panNumber || undefined,
+      udyamNumber: parsed.data.udyamNumber || undefined,
+    });
+  } catch {
+    // Provider misconfigured / unavailable (fail-closed): surface a clean error
+    // instead of a generic server-action crash, and do not persist a VERIFIED row.
+    return { ok: false, error: "KYC verification is temporarily unavailable. Please try again later." };
+  }
 
   const now = new Date();
   await prisma.shopKyc.upsert({

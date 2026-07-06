@@ -22,3 +22,9 @@ dist
 build
 coverage
 TODOS.md
+
+# CDK infra is its own package and never belongs in the app build context.
+infra
+Dockerfile
+Dockerfile.web
+.dockerignore

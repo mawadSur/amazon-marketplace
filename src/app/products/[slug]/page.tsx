@@ -3,6 +3,7 @@
 // Right: sticky buy-box with quantity, Buy Now, Add to Cart, trust badges.
 // Full-width customer reviews block below.
 
+import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import {
@@ -34,6 +35,50 @@ import { effectiveTier } from "@/lib/tiers";
 import { TierBadge } from "@/components/safety/tier-badge";
 
 export const dynamic = "force-dynamic";
+
+const SITE = "https://shezmin.com";
+
+// Plain-text, single-line summary of a product for meta tags / structured data.
+function metaDescription(title: string, description: string | null, shopName: string): string {
+  const raw = (description ?? "")
+    .replace(/\s*[-*•]\s+/g, " ") // flatten bullet markers
+    .replace(/\s+/g, " ")
+    .trim();
+  const base = raw || `${title} — hand-picked from ${shopName}, direct from India on Shezmin.`;
+  return base.length > 160 ? `${base.slice(0, 157).trimEnd()}…` : base;
+}
+
+export async function generateMetadata(props: {
+  params: Promise<{ slug: string }>;
+}): Promise<Metadata> {
+  const { slug } = await props.params;
+  const product = await getProductBySlug(slug);
+  if (!product || product.status !== "PUBLISHED" || product.shop.status !== "APPROVED") {
+    return { title: "Product not found" };
+  }
+  const description = metaDescription(product.title, product.description, product.shop.name);
+  const image = product.images[0]?.url;
+  const canonical = `/products/${product.slug}`;
+  return {
+    title: product.title,
+    description,
+    alternates: { canonical },
+    openGraph: {
+      type: "website",
+      title: product.title,
+      description,
+      url: canonical,
+      siteName: "Shezmin",
+      images: image ? [{ url: image, alt: product.title }] : undefined,
+    },
+    twitter: {
+      card: "summary_large_image",
+      title: product.title,
+      description,
+      images: image ? [image] : undefined,
+    },
+  };
+}
 
 function formatDeliveryDate(daysFromNow: number): string {
   const d = new Date();
@@ -92,8 +137,41 @@ export default async function ProductPage(props: { params: Promise<{ slug: strin
   const filledStars = Math.round(ratingValue);
   const categoryName = product.category?.name ?? "All";
 
+  // Product/Offer structured data for rich results (Google Merchant / SEO).
+  const jsonLd = {
+    "@context": "https://schema.org",
+    "@type": "Product",
+    name: product.title,
+    description: metaDescription(product.title, product.description, product.shop.name),
+    image: product.images.map((img) => img.url),
+    sku: product.id,
+    brand: { "@type": "Brand", name: product.shop.name },
+    offers: {
+      "@type": "Offer",
+      priceCurrency: "USD",
+      price: (product.priceUsdCents / 100).toFixed(2),
+      availability: inStock
+        ? "https://schema.org/InStock"
+        : "https://schema.org/OutOfStock",
+      url: `${SITE}/products/${product.slug}`,
+    },
+    ...(product.ratingCount > 0
+      ? {
+          aggregateRating: {
+            "@type": "AggregateRating",
+            ratingValue: ratingValue.toFixed(1),
+            reviewCount: product.ratingCount,
+          },
+        }
+      : {}),
+  };
+
   return (
     <>
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
+      />
       <MarketplaceNav />
       <main className="bg-background pb-12">
         <div className="mx-auto max-w-7xl px-4 py-3">

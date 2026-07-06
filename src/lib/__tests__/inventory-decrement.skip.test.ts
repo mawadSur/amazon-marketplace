@@ -14,30 +14,15 @@ import { describe, expect, it } from "vitest";
 //
 // To implement: lift these into the integration runner where `prisma` is wired
 // to a disposable test database (transactional rollback per test).
+//
+// NOTE: markPaymentCaptured's capture idempotency/concurrency AND the
+// conditional inventory-decrement branch behaviour (decrement, already-captured
+// no-op, oversell shortfall → refund) are now covered against a MOCKED Prisma
+// client in payments.test.ts. The skips below cover only surfaces that still
+// genuinely need a live DB / running worker (persisted trust-score writes read
+// back from the shop row, and the avatar queue worker) — those cannot be
+// meaningfully faked here without hiding real regressions.
 // ---------------------------------------------------------------------------
-
-// src/lib/payments.ts → markPaymentCaptured() performs a conditional inventory
-// decrement guarded by `where: { inventory: { gte: qty } }`.
-describe.skip("markPaymentCaptured — inventory decrement [P1-15 integration]", () => {
-  it("decrements Product.inventory by the captured qty for each order item", () => {
-    // Arrange: order with items {productId, qty}; product.inventory >= qty.
-    // Act: await markPaymentCaptured({ order, ... }).
-    // Assert: product.inventory === before - qty.
-    expect(true).toBe(true);
-  });
-
-  it("is idempotent — re-capturing an already-PAID/CAPTURED order does not double-decrement", () => {
-    // The capture path is only reached when the order was not already
-    // PAID/CAPTURED, so a second call must leave inventory unchanged.
-    expect(true).toBe(true);
-  });
-
-  it("guards against overselling — conditional decrement is a no-op when stock < qty", () => {
-    // Arrange: product.inventory < item.qty (stock vanished mid-flight).
-    // Assert: updateMany affects 0 rows, inventory stays >= 0, shortfall logged.
-    expect(true).toBe(true);
-  });
-});
 
 // src/lib/trust-score.ts → recomputeTrustScore() / scheduleTrustRecompute()
 // read shop signals from Prisma and write back trustScore/badge.

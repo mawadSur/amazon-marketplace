@@ -10,8 +10,27 @@
 
 import type { Prisma, ShipmentStatus } from "@prisma/client";
 import { prisma } from "@/lib/db";
+import { env } from "@/lib/env";
+import { log } from "@/lib/log";
 import { shiprocketCreateShipment } from "@/lib/stubs";
-import { markPayoutPaid } from "@/lib/payouts";
+import { enqueuePayouts, markPayoutPaid } from "@/lib/payouts";
+import { sendShippingUpdate } from "@/lib/email";
+
+const logger = log.child({ module: "shipments" });
+
+/**
+ * Fire a shipping-update email to the order's buyer. Fire-and-forget: email is
+ * a notification side-channel and must never block or fail a status write.
+ */
+function notifyShippingUpdate(
+  to: string | null | undefined,
+  inp: { orderId: string; status: string; trackingNumber?: string | null },
+): void {
+  if (!to) return;
+  void sendShippingUpdate(to, inp).catch((err) => {
+    logger.error({ err, orderId: inp.orderId }, "shipping update email failed");
+  });
+}
 
 export type ShipmentEvent = {
   at: string;
@@ -75,6 +94,7 @@ export async function createShipment(input: {
       id: true,
       status: true,
       shippingAddress: true,
+      buyer: { select: { email: true } },
       shipment: { select: { id: true } },
       items: {
         select: {
@@ -133,6 +153,12 @@ export async function createShipment(input: {
     return created;
   });
 
+  notifyShippingUpdate(order.buyer?.email, {
+    orderId: order.id,
+    status: "LABEL_CREATED",
+    trackingNumber: sr.trackingNumber,
+  });
+
   return shipment;
 }
 
@@ -153,7 +179,14 @@ export async function updateShipmentStatus(input: {
 }) {
   const shipment = await prisma.shipment.findUnique({
     where: { id: input.shipmentId },
-    select: { id: true, orderId: true, status: true, events: true },
+    select: {
+      id: true,
+      orderId: true,
+      status: true,
+      events: true,
+      trackingNumber: true,
+      order: { select: { buyer: { select: { email: true } } } },
+    },
   });
   if (!shipment) throw new Error("SHIPMENT_NOT_FOUND");
 
@@ -178,6 +211,12 @@ export async function updateShipmentStatus(input: {
     },
   });
 
+  notifyShippingUpdate(shipment.order?.buyer?.email, {
+    orderId: shipment.orderId,
+    status: input.status,
+    trackingNumber: shipment.trackingNumber,
+  });
+
   if (input.status === "DELIVERED") {
     // Flip order to DELIVERED if not already.
     const order = await prisma.order.findUnique({
@@ -191,16 +230,28 @@ export async function updateShipmentStatus(input: {
           data: { status: "DELIVERED", deliveredAt: now },
         });
       }
-      // Mark every payout that references any of this order's items as PAID.
-      const itemIds = order.items.map((it) => it.id);
-      if (itemIds.length > 0) {
-        const payouts = await prisma.payout.findMany({
-          where: { orderItemIds: { hasSome: itemIds } },
-          select: { id: true, status: true },
-        });
-        for (const p of payouts) {
-          if (p.status !== "PAID") {
-            await markPayoutPaid({ payoutId: p.id });
+
+      // Payouts are HELD until delivery (see src/lib/payouts.ts). Release them
+      // now: create one PROCESSING Payout per shop and initiate RazorpayX.
+      // Idempotent per (orderId, shopId), so a duplicate DELIVERED event (e.g. a
+      // re-sent tracking webhook) can't double-pay a seller.
+      await enqueuePayouts(order.id);
+
+      // In dev there is no RazorpayX webhook to confirm disbursement, so flip
+      // the just-created rows to PAID here to complete the flow. In production
+      // the payout.processed webhook (markPayoutPaid) does this once the money
+      // actually lands.
+      if (env.NODE_ENV !== "production") {
+        const itemIds = order.items.map((it) => it.id);
+        if (itemIds.length > 0) {
+          const payouts = await prisma.payout.findMany({
+            where: { orderItemIds: { hasSome: itemIds } },
+            select: { id: true, status: true },
+          });
+          for (const p of payouts) {
+            if (p.status !== "PAID") {
+              await markPayoutPaid({ payoutId: p.id });
+            }
           }
         }
       }
@@ -218,6 +269,13 @@ export async function updateShipmentStatus(input: {
  * Throws: SHIPMENT_NOT_FOUND.
  */
 export async function simulateShipmentProgress(shipmentId: string) {
+  // Fail closed: this dev helper fabricates lifecycle progress (including
+  // DELIVERED, which releases seller payouts). In production, status must come
+  // only from real Shiprocket tracking webhooks calling updateShipmentStatus.
+  if (env.NODE_ENV === "production") {
+    throw new Error("SIMULATION_DISABLED");
+  }
+
   const shipment = await prisma.shipment.findUnique({
     where: { id: shipmentId },
     select: { id: true, status: true },

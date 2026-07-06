@@ -6,110 +6,20 @@
 
 import { env } from "@/lib/env";
 import { generateText } from "@/lib/ai";
-import { prisma } from "@/lib/db";
 import { buildKey, putObject, publicUrl } from "@/lib/storage";
-import bcrypt from "bcryptjs";
 
-// ---------------------------------------------------------------- OTP (Module 1)
+// ---------------------------------------------------------------- Provider re-exports
+//
+// The external-integration stubs (OTP, KYC, RazorpayX payouts, Stripe,
+// Shiprocket) now live in src/lib/providers/* so phase-2 owners can wire real
+// SDK calls without touching this file. They are re-exported here so existing
+// importers of "@/lib/stubs" keep working unchanged.
 
-const STUB_OTP = "123456";
-
-export async function sendOtp(phone: string): Promise<{ sent: true; devCode?: string }> {
-  const code = env.TWILIO_VERIFY_SERVICE_SID
-    ? // Real-mode placeholder: when Twilio creds exist, the real call goes here.
-      // For now we still write the OTP row so the auth flow works in dev.
-      Math.floor(100000 + Math.random() * 900000).toString()
-    : STUB_OTP;
-
-  const hash = await bcrypt.hash(code, 10);
-  await prisma.otpCode.create({
-    data: {
-      phone,
-      codeHash: hash,
-      expiresAt: new Date(Date.now() + 10 * 60_000),
-    },
-  });
-
-  // In stub mode, expose the code so dev UI can show it. NEVER do this in prod.
-  return env.TWILIO_VERIFY_SERVICE_SID ? { sent: true } : { sent: true, devCode: code };
-}
-
-// ---------------------------------------------------------------- KYC (Module 1)
-
-export async function verifyKyc(inp: {
-  gstNumber?: string;
-  panNumber?: string;
-  udyamNumber?: string;
-}): Promise<{ verified: boolean; reason?: string }> {
-  // Stub: any non-empty value passes. Real provider integration goes here.
-  if (!inp.gstNumber && !inp.panNumber && !inp.udyamNumber) {
-    return { verified: false, reason: "Provide at least one of GST / PAN / Udyam." };
-  }
-  return { verified: true };
-}
-
-// ---------------------------------------------------------------- Razorpay payouts (Module 1/4)
-
-export async function razorpayCreateFundAccount(inp: {
-  name: string;
-  accountNumber: string;
-  ifsc: string;
-}): Promise<{ contactId: string; fundAccountId: string }> {
-  // Stub returns deterministic IDs derived from input.
-  const suffix = Buffer.from(inp.accountNumber).toString("hex").slice(0, 12);
-  return { contactId: `cont_stub_${suffix}`, fundAccountId: `fa_stub_${suffix}` };
-}
-
-export async function razorpayCreatePayout(inp: {
-  fundAccountId: string;
-  amountInrPaise: number;
-  reference: string;
-}): Promise<{ payoutId: string; status: "processing" }> {
-  return { payoutId: `pout_stub_${inp.reference}`, status: "processing" };
-}
-
-// ---------------------------------------------------------------- Stripe (Module 4)
-
-export async function stripeCreateCheckout(inp: {
-  orderId: string;
-  amountUsdCents: number;
-}): Promise<{ url: string; intentId: string }> {
-  return {
-    url: `/checkout/stub/${inp.orderId}`,
-    intentId: `pi_stub_${inp.orderId}`,
-  };
-}
-
-export async function stripeRefund(inp: {
-  chargeId?: string | null;
-  intentId?: string | null;
-  amountUsdCents: number;
-  reason?: string;
-}): Promise<{ refundId: string; status: "succeeded" }> {
-  const tail = (inp.chargeId ?? inp.intentId ?? "unknown").slice(-12);
-  return { refundId: `re_stub_${tail}`, status: "succeeded" };
-}
-
-// ---------------------------------------------------------------- Shiprocket (Module 5)
-
-export async function shiprocketCreateShipment(inp: {
-  orderId: string;
-  weightGrams: number;
-  destinationCountry: string;
-}): Promise<{
-  trackingNumber: string;
-  labelUrl: string;
-  customsDocUrl: string;
-  estimatedDelivery: Date;
-}> {
-  const eta = new Date(Date.now() + 9 * 24 * 60 * 60_000);
-  return {
-    trackingNumber: `SR${inp.orderId.toUpperCase()}`,
-    labelUrl: `/stub/labels/${inp.orderId}.pdf`,
-    customsDocUrl: `/stub/customs/${inp.orderId}.pdf`,
-    estimatedDelivery: eta,
-  };
-}
+export { sendOtp } from "@/lib/providers/twilio"; // Module 1
+export { verifyKyc } from "@/lib/providers/kyc"; // Module 1
+export { razorpayCreateFundAccount, razorpayCreatePayout } from "@/lib/providers/razorpay"; // Module 1/4
+export { stripeCreateCheckout, stripeRefund } from "@/lib/providers/stripe"; // Module 4
+export { shiprocketCreateShipment } from "@/lib/providers/shiprocket"; // Module 5
 
 // ---------------------------------------------------------------- Background removal (Module 2)
 

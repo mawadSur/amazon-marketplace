@@ -1,0 +1,27 @@
+{
+  "name": "shezmin-infra",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AWS CDK app for the Shezmin marketplace (VPC, ECS Fargate web+worker, RDS, ElastiCache, S3, CloudFront/Route53/ACM, ECR, GitHub OIDC).",
+  "bin": {
+    "shezmin-infra": "bin/app.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "typecheck": "tsc --noEmit",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "deploy": "cdk deploy",
+    "bootstrap": "cdk bootstrap"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "aws-cdk": "^2.170.0",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.170.0",
+    "constructs": "^10.4.2"
+  }
+}

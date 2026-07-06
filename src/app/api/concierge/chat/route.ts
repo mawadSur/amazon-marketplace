@@ -8,6 +8,7 @@
 
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { auth } from "@/lib/auth";
 import { rateLimit, clientKey, rateLimitHeaders } from "@/lib/ratelimit";
 import {
   parseIntent,
@@ -78,7 +79,15 @@ function toCards(rows: Awaited<ReturnType<typeof searchWithIntent>>): CardResult
 }
 
 export async function POST(req: Request) {
-  const rl = await rateLimit(clientKey(req, "concierge.chat"), 20, 60);
+  // The utterance path calls the Anthropic-backed intent parser, so an
+  // unauthenticated caller can amplify LLM spend. Cap anonymous traffic hard
+  // and key per-IP; signed-in users are trusted with a higher, per-user ceiling.
+  const session = await auth();
+  const userId = session?.user?.id ?? null;
+  const { limit, windowSeconds } = userId
+    ? { limit: 40, windowSeconds: 60 }
+    : { limit: 6, windowSeconds: 60 };
+  const rl = await rateLimit(clientKey(req, "concierge.chat", userId), limit, windowSeconds);
   if (!rl.ok) {
     return NextResponse.json(
       { error: "Slow down a moment." },

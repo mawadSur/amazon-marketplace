@@ -5,6 +5,7 @@
 
 import { prisma } from "@/lib/db";
 import { enqueueRefund } from "@/lib/payments";
+import { reversePayoutsForOrder } from "@/lib/payouts";
 import { claimBuyerProtection, resolveBuyerProtection } from "@/lib/buyer-protection";
 import { enqueueTrustRecompute } from "@/lib/trust-score";
 import type {
@@ -183,6 +184,10 @@ export async function resolveDispute(input: ResolveDisputeInput): Promise<Disput
       } catch {
         /* refund retried by the payments.refund worker */
       }
+      // Claw back any payouts already released to sellers (post-delivery
+      // disputes). No-op when funds were still held (pre-delivery). Best-effort:
+      // reversePayoutsForOrder never throws, so it can't block the buyer refund.
+      await reversePayoutsForOrder(dispute.orderId, resolution);
       try {
         await resolveBuyerProtection(dispute.orderId, "PAID", resolution);
       } catch {

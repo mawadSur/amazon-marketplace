@@ -1,5 +1,6 @@
 // /shop/category/[slug] — Amazon-style category results. Sidebar + dense grid.
 
+import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { MarketplaceNav } from "@/components/buyer/marketplace-nav";
@@ -13,6 +14,33 @@ import {
 import { prisma } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
+
+export async function generateMetadata(props: {
+  params: Promise<{ slug: string }>;
+}): Promise<Metadata> {
+  const { slug } = await props.params;
+  const category = await prisma.category.findUnique({ where: { slug } });
+  if (!category) return { title: "Category not found" };
+  const description = `Shop ${category.name.toLowerCase()} from vetted Indian artisans — curated on Shezmin with try-on previews and a return guarantee.`;
+  const canonical = `/shop/category/${category.slug}`;
+  return {
+    title: category.name,
+    description,
+    alternates: { canonical },
+    openGraph: {
+      type: "website",
+      title: `${category.name} · Shezmin`,
+      description,
+      url: canonical,
+      siteName: "Shezmin",
+    },
+    twitter: {
+      card: "summary",
+      title: `${category.name} · Shezmin`,
+      description,
+    },
+  };
+}
 
 export default async function CategoryPage(props: { params: Promise<{ slug: string }> }) {
   const { slug } = await props.params;

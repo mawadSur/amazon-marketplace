@@ -1,6 +1,7 @@
 // /shop/[shopSlug] — Amazon "brand store" feel. Breadcrumbs, hero banner,
 // product grid, and a collapsible About section.
 
+import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { MapPin } from "lucide-react";
@@ -14,6 +15,38 @@ import { effectiveTier } from "@/lib/tiers";
 import { parseStoryScript } from "@/lib/story-video";
 
 export const dynamic = "force-dynamic";
+
+export async function generateMetadata(props: {
+  params: Promise<{ shopSlug: string }>;
+}): Promise<Metadata> {
+  const { shopSlug } = await props.params;
+  const shop = await getShopBySlug(shopSlug);
+  if (!shop) return { title: "Shop not found" };
+  const description =
+    shop.bio?.trim() ||
+    `Shop ${shop.name} — a verified Shezmin boutique based in ${shop.city}, ${shop.region}.`;
+  const canonical = `/shop/${shop.slug}`;
+  const image = shop.bannerUrl ?? shop.logoUrl ?? undefined;
+  return {
+    title: shop.name,
+    description,
+    alternates: { canonical },
+    openGraph: {
+      type: "website",
+      title: shop.name,
+      description,
+      url: canonical,
+      siteName: "Shezmin",
+      images: image ? [{ url: image, alt: `${shop.name} store` }] : undefined,
+    },
+    twitter: {
+      card: image ? "summary_large_image" : "summary",
+      title: shop.name,
+      description,
+      images: image ? [image] : undefined,
+    },
+  };
+}
 
 export default async function ShopPage(props: {
   params: Promise<{ shopSlug: string }>;
