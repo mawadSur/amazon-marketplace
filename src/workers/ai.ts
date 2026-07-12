@@ -16,7 +16,8 @@
 import * as Sentry from "@sentry/node";
 import type { AiJob, Product } from "@prisma/client";
 import { prisma } from "@/lib/db";
-import { makeWorker, type QueueName } from "@/lib/queue";
+import { makeWorker, schedulePayoutBatch, payoutBatchCron, type QueueName } from "@/lib/queue";
+import { startPayoutBatchWorker } from "./payouts";
 import { log } from "@/lib/log";
 
 const wlog = log.child({ module: "worker" });
@@ -220,8 +221,10 @@ async function attachTags(productId: string, tagSlugs: string[]) {
 
 function startRefunds() {
   return makeWorker<RefundJobPayload>("payments.refund", async (j) => {
-    // refundOrder is idempotent — replays in the retry queue are safe.
-    await refundOrder({ orderId: j.data.orderId, reason: j.data.reason });
+    // refundOrder is idempotent — replays in the retry queue are safe. Pass the
+    // whole payload so a partial per-shop refund (shopId + orderItemIds) retries
+    // as a partial refund, not a full-order one.
+    await refundOrder(j.data);
     return { ok: true };
   });
 }
@@ -326,6 +329,7 @@ const workers = [
   startStoryVideo(),
   startTrustRecompute(),
   startAvatarVideo(),
+  startPayoutBatchWorker(),
 ];
 
 const queueNames: QueueName[] = [
@@ -337,7 +341,18 @@ const queueNames: QueueName[] = [
   "ai.story_video",
   "trust.recompute",
   "ai.avatar_video",
+  "payouts.batch",
 ];
+
+// Register the repeatable weekly payout batch (idempotent — upserts the
+// scheduler on every boot so a changed PAYOUT_RUN_WEEKDAY takes effect on
+// deploy). Best-effort: a scheduling hiccup must not stop the AI workers.
+void schedulePayoutBatch()
+  .then(() => wlog.info({ cron: payoutBatchCron() }, "weekly payout batch scheduled"))
+  .catch((err) => {
+    wlog.error({ err }, "failed to schedule weekly payout batch");
+    if (process.env.SENTRY_DSN) Sentry.captureException(err, { tags: { hook: "schedulePayoutBatch" } });
+  });
 
 // Reference workers by name so registration order can't silently break the
 // completion hooks below.

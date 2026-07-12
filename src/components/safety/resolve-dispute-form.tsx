@@ -73,6 +73,12 @@ export function ResolveDisputeForm({
 
       {error ? <p className="text-sm text-red-700">{error}</p> : null}
 
+      <p className="text-xs text-muted-foreground">
+        Resolving in favor of the buyer refunds ONLY this shop&apos;s disputed
+        items and claws back only this shop&apos;s payout. Other shops on the
+        order are untouched.
+      </p>
+
       <div className="flex flex-wrap gap-2">
         <Button
           type="button"

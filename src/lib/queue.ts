@@ -42,7 +42,10 @@ export type QueueName =
   | "ai.story_video"
   | "ai.avatar_video"
   | "trust.recompute"
-  | "payments.refund";
+  | "payments.refund"
+  // Weekly bulk seller-payout batch (Wave 2). Driven by a BullMQ repeatable job
+  // (see schedulePayoutBatch) whose processor calls runPayoutBatch().
+  | "payouts.batch";
 
 const _queues = new Map<QueueName, Queue>();
 
@@ -69,4 +72,86 @@ export function makeWorker<T = unknown>(
     concurrency: 2,
     ...opts,
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Weekly payout batch schedule (Wave 2)
+//
+// The batch runs once a week on PAYOUT_RUN_WEEKDAY at a fixed UTC time. The cron
+// day-of-week + a Redis-independent nextPayoutRunAt() are derived here so the
+// admin dashboard can show the schedule without touching Redis, and the worker
+// registers the repeatable job via schedulePayoutBatch().
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Cron/JS day-of-week index: Sunday = 0 … Saturday = 6. */
+const WEEKDAYS = [
+  "SUNDAY",
+  "MONDAY",
+  "TUESDAY",
+  "WEDNESDAY",
+  "THURSDAY",
+  "FRIDAY",
+  "SATURDAY",
+] as const;
+
+/** Fixed run time (UTC) for the weekly batch. */
+export const PAYOUT_BATCH_HOUR_UTC = 9;
+export const PAYOUT_BATCH_MINUTE_UTC = 0;
+
+/** BullMQ job-scheduler id for the repeatable weekly batch. */
+export const PAYOUT_BATCH_SCHEDULER_ID = "weekly-payout-batch";
+
+/** Resolve PAYOUT_RUN_WEEKDAY to a 0–6 index (defaults to Monday = 1). */
+export function payoutRunWeekdayIndex(): number {
+  const idx = WEEKDAYS.indexOf(env.PAYOUT_RUN_WEEKDAY.trim().toUpperCase() as (typeof WEEKDAYS)[number]);
+  return idx >= 0 ? idx : 1;
+}
+
+/** Canonical weekday name the batch runs on (e.g. "MONDAY"). */
+export function payoutRunWeekdayName(): string {
+  return WEEKDAYS[payoutRunWeekdayIndex()];
+}
+
+/** Cron expression (UTC) for the weekly batch, e.g. "0 9 * * 1". */
+export function payoutBatchCron(): string {
+  return `${PAYOUT_BATCH_MINUTE_UTC} ${PAYOUT_BATCH_HOUR_UTC} * * ${payoutRunWeekdayIndex()}`;
+}
+
+/**
+ * Next scheduled batch run STRICTLY after `now`, computed in UTC without a cron
+ * library (so it works on the admin server component without a Redis round-trip).
+ */
+export function nextPayoutRunAt(now: Date = new Date()): Date {
+  const dow = payoutRunWeekdayIndex();
+  const next = new Date(
+    Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate(),
+      PAYOUT_BATCH_HOUR_UTC,
+      PAYOUT_BATCH_MINUTE_UTC,
+      0,
+      0,
+    ),
+  );
+  let add = (dow - next.getUTCDay() + 7) % 7;
+  // If today is the run day but the run time has already passed (or is exactly
+  // now), roll forward a full week.
+  if (add === 0 && next.getTime() <= now.getTime()) add = 7;
+  next.setUTCDate(next.getUTCDate() + add);
+  return next;
+}
+
+/**
+ * Register (idempotently) the repeatable weekly payout batch. Safe to call on
+ * every worker boot — upsertJobScheduler replaces any existing scheduler with
+ * the same id, so a changed PAYOUT_RUN_WEEKDAY takes effect on the next deploy.
+ */
+export async function schedulePayoutBatch(): Promise<void> {
+  const q = getQueue("payouts.batch");
+  await q.upsertJobScheduler(
+    PAYOUT_BATCH_SCHEDULER_ID,
+    { pattern: payoutBatchCron(), tz: "UTC" },
+    { name: "payouts.batch", opts: { removeOnComplete: { count: 50 }, removeOnFail: false } },
+  );
 }

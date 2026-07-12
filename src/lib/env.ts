@@ -35,6 +35,15 @@ const serverSchema = z.object({
   RAZORPAY_WEBHOOK_SECRET: z.string().optional(),
   // RazorpayX source account (the payer account funds are debited from) for payouts.
   RAZORPAY_ACCOUNT_NUMBER: z.string().optional(),
+  // Weekly bulk payout scheduler (Wave 2). Seller payouts are HELD at delivery
+  // and disbursed in a weekly batch on this weekday. Accepts a weekday NAME
+  // (case-insensitive, e.g. "MONDAY"); anything unrecognised falls back to
+  // Monday in the schedule helpers. Default: Monday.
+  PAYOUT_RUN_WEEKDAY: z.string().default("MONDAY"),
+  // Hold window in DAYS after delivery before a payout becomes eligible for the
+  // weekly batch (gives the buyer time to open a dispute before money leaves
+  // escrow). Coerced from the string env value. Default: 5.
+  PAYOUT_HOLD_DAYS: z.coerce.number().int().min(0).default(5),
   TWILIO_ACCOUNT_SID: z.string().optional(),
   TWILIO_AUTH_TOKEN: z.string().optional(),
   TWILIO_VERIFY_SERVICE_SID: z.string().optional(),
@@ -58,8 +67,29 @@ const serverSchema = z.object({
   // Nickname of a pickup location configured in the Shiprocket dashboard; sent
   // as `pickup_location` on ad-hoc orders. Defaults to "Primary".
   SHIPROCKET_PICKUP_LOCATION: z.string().default("Primary"),
+  // KYC — Signzy API gateway (primary provider). When these are set, seller KYC
+  // (PAN / GSTIN / Udyam) is verified against Signzy. The provider exchanges
+  // username+password (+optional realm) for an access token, then calls the
+  // per-identifier endpoints. Endpoint paths are configurable so the exact
+  // account-specific paths can be corrected without a code change.
+  SIGNZY_BASE_URL: z.string().url().optional(),
+  SIGNZY_USERNAME: z.string().optional(),
+  SIGNZY_PASSWORD: z.string().optional(),
+  // Optional tenant/realm sent on the Signzy login call (some accounts require it).
+  SIGNZY_REALM: z.string().optional(),
+  // Signzy endpoint paths (relative to SIGNZY_BASE_URL). Defaults are best-effort
+  // and MUST be confirmed against the owner's Signzy account. A path may contain
+  // a `{userId}` placeholder (substituted with the login user id) for the
+  // legacy "patrons" style endpoints.
+  SIGNZY_LOGIN_PATH: z.string().default("/api/backopsusers/login"),
+  SIGNZY_PAN_PATH: z.string().default("/api/v3/getpandetails"),
+  SIGNZY_GSTIN_PATH: z.string().default("/api/v3/gstin"),
+  // Optional: only set when the account has an Udyam/MSME verification endpoint.
+  SIGNZY_UDYAM_PATH: z.string().optional(),
+  // Legacy generic KYC provider (SUPERSEDED by SIGNZY_* above). Kept so existing
+  // deployments that set these keep working: used only when no SIGNZY_* creds are
+  // present. Prefer migrating to the Signzy vars.
   KYC_PROVIDER_API_KEY: z.string().optional(),
-  // Base URL of the KYC verification provider's REST API.
   KYC_PROVIDER_BASE_URL: z.string().url().optional(),
   // Transactional email (Resend).
   RESEND_API_KEY: z.string().optional(),

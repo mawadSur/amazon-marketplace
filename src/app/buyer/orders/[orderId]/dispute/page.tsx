@@ -44,8 +44,18 @@ export default async function OpenDisputePage({
     );
   }
 
-  const alreadyDisputed = order.status === "DISPUTED";
   const ineligible = ["PLACED", "CANCELLED", "REFUNDED"].includes(order.status);
+  // Per-shop disputes: an item is disputable only while ACTIVE. DISPUTED items
+  // already belong to a dispute; REFUNDED items are done.
+  const formItems = order.items.map((it) => ({
+    id: it.id,
+    title: it.product.title,
+    shopId: it.shopId,
+    shopName: it.product.shop.name,
+    qty: it.qty,
+    status: it.status,
+  }));
+  const noDisputableItems = !formItems.some((it) => it.status === "ACTIVE");
 
   return (
     <>
@@ -67,17 +77,7 @@ export default async function OpenDisputePage({
 
         <div className="mt-6 grid gap-6 lg:grid-cols-3">
           <section className="lg:col-span-2">
-            {alreadyDisputed ? (
-              <Card>
-                <CardContent className="py-8 text-center text-sm text-muted-foreground">
-                  A dispute is already open on this order.{" "}
-                  <Link href="/buyer/disputes" className="underline">
-                    View your disputes
-                  </Link>
-                  .
-                </CardContent>
-              </Card>
-            ) : ineligible ? (
+            {ineligible ? (
               <Card>
                 <CardContent className="py-8 text-center text-sm text-muted-foreground">
                   This order isn&apos;t eligible for a dispute (status:{" "}
@@ -85,8 +85,18 @@ export default async function OpenDisputePage({
                   mistake, please contact support.
                 </CardContent>
               </Card>
+            ) : noDisputableItems ? (
+              <Card>
+                <CardContent className="py-8 text-center text-sm text-muted-foreground">
+                  Every item on this order is already in a dispute or refunded.{" "}
+                  <Link href="/buyer/disputes" className="underline">
+                    View your disputes
+                  </Link>
+                  .
+                </CardContent>
+              </Card>
             ) : (
-              <DisputeForm orderId={order.id} />
+              <DisputeForm orderId={order.id} items={formItems} />
             )}
           </section>
 

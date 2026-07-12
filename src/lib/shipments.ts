@@ -13,7 +13,7 @@ import { prisma } from "@/lib/db";
 import { env } from "@/lib/env";
 import { log } from "@/lib/log";
 import { shiprocketCreateShipment } from "@/lib/stubs";
-import { enqueuePayouts, markPayoutPaid } from "@/lib/payouts";
+import { enqueuePayouts } from "@/lib/payouts";
 import { sendShippingUpdate } from "@/lib/email";
 
 const logger = log.child({ module: "shipments" });
@@ -257,7 +257,7 @@ export async function updateShipmentStatus(input: {
     // Flip order to DELIVERED if not already.
     const order = await prisma.order.findUnique({
       where: { id: shipment.orderId },
-      select: { id: true, status: true, deliveredAt: true, items: { select: { id: true } } },
+      select: { id: true, status: true, deliveredAt: true },
     });
     if (order) {
       if (order.status !== "DELIVERED" && !order.deliveredAt) {
@@ -267,30 +267,14 @@ export async function updateShipmentStatus(input: {
         });
       }
 
-      // Payouts are HELD until delivery (see src/lib/payouts.ts). Release them
-      // now: create one PROCESSING Payout per shop and initiate RazorpayX.
-      // Idempotent per (orderId, shopId), so a duplicate DELIVERED event (e.g. a
-      // re-sent tracking webhook) can't double-pay a seller.
+      // Platform-holds-then-distributes (Wave 2): delivery only CREATES the
+      // per-shop Payout rows as PENDING (held) with eligibleAt = deliveredAt. NO
+      // money moves and NO escrow RELEASE happens here — the weekly bulk batch
+      // (runPayoutBatch) disburses them after the PAYOUT_HOLD_DAYS window, so a
+      // dispute during the window can still reduce/cancel the payout. Idempotent
+      // per (orderId, shopId): a re-sent DELIVERED event can't create a second
+      // held payout.
       await enqueuePayouts(order.id);
-
-      // In dev there is no RazorpayX webhook to confirm disbursement, so flip
-      // the just-created rows to PAID here to complete the flow. In production
-      // the payout.processed webhook (markPayoutPaid) does this once the money
-      // actually lands.
-      if (env.NODE_ENV !== "production") {
-        const itemIds = order.items.map((it) => it.id);
-        if (itemIds.length > 0) {
-          const payouts = await prisma.payout.findMany({
-            where: { orderItemIds: { hasSome: itemIds } },
-            select: { id: true, status: true },
-          });
-          for (const p of payouts) {
-            if (p.status !== "PAID") {
-              await markPayoutPaid({ payoutId: p.id });
-            }
-          }
-        }
-      }
     }
   }
 

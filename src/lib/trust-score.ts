@@ -138,9 +138,10 @@ export async function recomputeTrustScore(shopId: string): Promise<TrustResult> 
           _avg: { rating: true },
         })
       : Promise.resolve({ _count: { _all: 0 }, _avg: { rating: 0 } }),
-    // Disputes opened on orders that contain at least one of this shop's items.
+    // Disputes filed against THIS shop (per-shop disputes carry shopId directly,
+    // so a dispute against another shop on a shared order no longer counts here).
     prisma.dispute.count({
-      where: { order: { items: { some: { shopId } } } },
+      where: { shopId },
     }),
     // Paid order count for this shop.
     prisma.order.count({

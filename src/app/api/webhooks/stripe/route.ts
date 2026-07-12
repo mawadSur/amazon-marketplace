@@ -24,7 +24,7 @@ import { z } from "zod";
 import { Prisma } from "@prisma/client";
 import { env } from "@/lib/env";
 import { prisma } from "@/lib/db";
-import { markPaymentCaptured } from "@/lib/payments";
+import { markPaymentCaptured, refundOrder } from "@/lib/payments";
 import { reversePayoutsForOrder } from "@/lib/payouts";
 
 const stubSchema = z.object({
@@ -156,16 +156,20 @@ async function handleChargeRefunded(event: Stripe.Event): Promise<void> {
     return;
   }
 
-  // Reconcile Payment -> REFUNDED (only from a live status; never revive) and the
-  // Order -> REFUNDED unless it's already in a terminal refunded state.
+  // Reconcile Payment -> REFUNDED FIRST (only from a live status; never revive) so
+  // the internal refund path below takes its NO-GATEWAY heal branch — Stripe already
+  // refunded at the dashboard, so we must never re-charge.
   await prisma.payment.updateMany({
     where: { orderId, status: { not: "REFUNDED" } },
     data: { status: "REFUNDED" },
   });
-  await prisma.order.updateMany({
-    where: { id: orderId, status: { not: "REFUNDED" } },
-    data: { status: "REFUNDED" },
-  });
+
+  // Record the escrow REFUND and mark every item + the Order REFUNDED. refundOrder,
+  // seeing Payment already REFUNDED, heals the ledger without a second gateway call.
+  // Without this a dashboard-initiated full refund never incremented refundedUsdCents
+  // (leaving the refunded amount miscategorised as still-held) and left OrderItems
+  // ACTIVE. Idempotent: the escrow REFUND ref and the item/order updates all converge.
+  await refundOrder({ orderId, reason: `stripe refund ${chargeId ?? event.id}` });
 
   // Claw back any seller payouts already released for the now-refunded order.
   // Idempotent: reversePayoutsForOrder only touches PROCESSING/PAID payouts, so

@@ -1,9 +1,12 @@
 "use client";
 
-// Buyer-facing form to open a dispute on an order. Posts to /api/disputes,
+// Buyer-facing form to open a PER-SHOP dispute on specific order items. The
+// buyer selects the item(s) that went wrong; a dispute covers exactly ONE shop,
+// so selecting an item from a second shop clears the previous shop's selection.
+// Posts to /api/disputes with { orderId, orderItemIds, reason, description },
 // then redirects to the buyer's view of the new dispute.
 
-import { useState, useTransition } from "react";
+import { useMemo, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -17,18 +20,63 @@ const REASONS: { value: string; label: string }[] = [
   { value: "OTHER", label: "Other" },
 ];
 
-export function DisputeForm({ orderId }: { orderId: string }) {
+export type DisputeFormItem = {
+  id: string;
+  title: string;
+  shopId: string;
+  shopName: string;
+  qty: number;
+  /** ACTIVE items are selectable; DISPUTED / REFUNDED are shown but disabled. */
+  status: string;
+};
+
+export function DisputeForm({
+  orderId,
+  items,
+}: {
+  orderId: string;
+  items: DisputeFormItem[];
+}) {
   const router = useRouter();
   const [reason, setReason] = useState(REASONS[0].value);
   const [description, setDescription] = useState("");
   const [evidence, setEvidence] = useState<string[]>(["", "", ""]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
+
+  const itemsById = useMemo(() => new Map(items.map((it) => [it.id, it])), [items]);
+
+  function toggle(itemId: string) {
+    const item = itemsById.get(itemId);
+    if (!item) return;
+    setError(null);
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(itemId)) {
+        next.delete(itemId);
+        return next;
+      }
+      // Enforce single-shop scope: adding an item from a different shop clears
+      // any previously-selected items from another shop.
+      const currentShop = [...next]
+        .map((id) => itemsById.get(id)?.shopId)
+        .find(Boolean);
+      if (currentShop && currentShop !== item.shopId) next.clear();
+      next.add(itemId);
+      return next;
+    });
+  }
 
   function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
 
+    const orderItemIds = [...selected];
+    if (orderItemIds.length === 0) {
+      setError("Select at least one item to dispute.");
+      return;
+    }
     if (description.trim().length < 10) {
       setError("Please describe what went wrong (at least 10 characters).");
       return;
@@ -41,6 +89,7 @@ export function DisputeForm({ orderId }: { orderId: string }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           orderId,
+          orderItemIds,
           reason,
           description: description.trim(),
           evidenceUrls: evidenceUrls.length > 0 ? evidenceUrls : undefined,
@@ -61,6 +110,48 @@ export function DisputeForm({ orderId }: { orderId: string }) {
 
   return (
     <form onSubmit={onSubmit} className="space-y-5 rounded-lg border bg-card p-6">
+      <div className="space-y-2">
+        <Label>Which item(s) went wrong?</Label>
+        <p className="text-xs text-muted-foreground">
+          A dispute covers items from one shop. Selecting an item from another
+          shop starts a fresh selection.
+        </p>
+        <ul className="space-y-2">
+          {items.map((it) => {
+            const selectable = it.status === "ACTIVE";
+            const isChecked = selected.has(it.id);
+            return (
+              <li key={it.id}>
+                <label
+                  className={`flex items-start gap-3 rounded-md border p-3 text-sm ${
+                    selectable ? "cursor-pointer hover:bg-accent" : "opacity-60"
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={isChecked}
+                    disabled={!selectable || pending}
+                    onChange={() => toggle(it.id)}
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate font-medium">{it.title}</span>
+                    <span className="block truncate text-xs text-muted-foreground">
+                      {it.shopName} · qty {it.qty}
+                      {it.status === "DISPUTED"
+                        ? " · already in a dispute"
+                        : it.status === "REFUNDED"
+                          ? " · refunded"
+                          : ""}
+                    </span>
+                  </span>
+                </label>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+
       <div className="space-y-2">
         <Label htmlFor="dispute-reason">Reason</Label>
         <select
@@ -113,9 +204,19 @@ function humanizeError(code?: string): string | null {
     case "ORDER_NOT_FOUND":
       return "We couldn't find that order on your account.";
     case "ALREADY_DISPUTED":
-      return "A dispute is already open on this order.";
+      return "A dispute is already open for this shop on this order.";
     case "ORDER_NOT_DISPUTABLE":
       return "This order isn't eligible for a dispute yet.";
+    case "ITEMS_REQUIRED":
+      return "Select at least one item to dispute.";
+    case "ITEMS_INVALID":
+      return "One of the selected items isn't part of this order.";
+    case "ITEMS_MULTIPLE_SHOPS":
+      return "A dispute can only cover items from a single shop.";
+    case "ITEMS_NOT_DISPUTABLE":
+      return "One of the selected items can't be disputed (already refunded).";
+    case "CLAIM_WINDOW_EXPIRED":
+      return "The dispute window for this order has closed.";
     case "FORBIDDEN":
       return "Only buyers can open disputes.";
     case "UNAUTHENTICATED":

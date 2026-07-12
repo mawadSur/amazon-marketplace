@@ -2,21 +2,30 @@
 // Payout row per shop, and disburse via RazorpayX. The webhook handler later
 // flips PROCESSING → PAID via markPayoutPaid().
 //
-// TIMING (clawback fix): payouts are HELD until delivery. markPaymentCaptured no
-// longer calls enqueuePayouts — the order's DELIVERED transition does (see
-// follow-up note for src/lib/shipments.ts). Disbursing only after delivery means
-// a pre-delivery refund never has to recover funds already sent to a seller. For
-// the post-delivery dispute case, reversePayoutsForOrder claws back.
+// TIMING — platform holds, then distributes (Wave 2 weekly scheduler):
+//   1. At DELIVERED, enqueuePayouts CREATES one PENDING Payout per shop with
+//      eligibleAt = deliveredAt. NO money moves and NO escrow RELEASE is
+//      recorded yet — funds stay in escrow (the platform holds them).
+//   2. A weekly bulk batch (runPayoutBatch) picks up PENDING payouts whose
+//      hold window (PAYOUT_HOLD_DAYS after eligibleAt) has elapsed, RECOMPUTES
+//      each shop's net owed EXCLUDING refunded/disputed items (so a dispute
+//      during the hold window reduces/cancels the payout before money leaves),
+//      then disburses via RazorpayX, flips PENDING→PROCESSING, stamps
+//      disbursedAt, and records the escrow RELEASE for the net amount.
+//   3. markPayoutPaid flips PROCESSING→PAID on the RazorpayX webhook.
+//
+// Holding until the window elapses means a pre-disbursement refund/dispute never
+// has to recover funds already sent to a seller — reversePayoutsForOrder simply
+// CANCELS a still-PENDING payout (no gateway reversal). Only a disbursed
+// (PROCESSING/PAID) payout needs a real clawback.
 
 import { Prisma } from "@prisma/client";
 import * as Sentry from "@sentry/nextjs";
 import { prisma } from "@/lib/db";
 import { razorpayCreatePayout } from "@/lib/stubs";
-// razorpayReversePayout is not part of the stubs re-export surface — import it
-// straight from the provider module.
-import { razorpayReversePayout } from "@/lib/providers/razorpay";
 import { usdCentsToInrPaiseAt } from "@/lib/fx";
 import { shopNetUsdCents } from "@/lib/fees";
+import { reverseReleaseEscrow } from "@/lib/escrow";
 import { sendPayoutNotification } from "@/lib/email";
 import { log } from "@/lib/log";
 
@@ -27,27 +36,46 @@ export type EnqueuePayoutsResult = {
 };
 
 /**
- * Release payouts for a DELIVERED order. For each shop with items in the order:
+ * At DELIVERED, CREATE a HELD payout per shop — funds stay in escrow until the
+ * weekly batch disburses them. For each shop with items in the order:
  *   - subtotal = sum(qty * unitPriceUsdCents) for that shop's order items
  *   - net (USD cents) = full shop subtotal (the 10% platform fee is collected
  *     from the buyer at checkout, NOT deducted from the seller here)
  *   - amount (INR paise) = net converted at the order's snapshotted fxRate
- *   - create Payout row (with orderId), call RazorpayX, persist payoutId
+ *   - create Payout row status PENDING with eligibleAt = deliveredAt
  *
- * Idempotent per (orderId, shopId) via the DB unique constraint — a re-run (or
- * a duplicate delivery event) can't double-pay a seller.
+ * NO money moves and NO escrow RELEASE happens here — both are deferred to
+ * runPayoutBatch after the hold window elapses (platform-holds-then-distributes).
+ * The stored amountInrPaise is the delivery-time estimate; the batch RECOMPUTES
+ * it (excluding refunded/disputed items) before disbursing.
+ *
+ * Idempotent per (orderId, shopId) via the DB unique constraint — a re-run (or a
+ * duplicate delivery event) can't create a second held payout for a seller.
  */
 export async function enqueuePayouts(orderId: string): Promise<EnqueuePayoutsResult> {
   const order = await prisma.order.findUnique({
     where: { id: orderId },
     select: {
       id: true,
+      status: true,
       fxRate: true,
+      deliveredAt: true,
       items: { select: { id: true, shopId: true, qty: true, unitPriceUsdCents: true } },
     },
   });
   if (!order) throw new Error("ORDER_NOT_FOUND");
+  // Never create a payout for a refunded/cancelled order. A whole-order refund or
+  // card chargeback flips Order→REFUNDED but leaves OrderItems ACTIVE, and a late
+  // DELIVERED event would otherwise enqueue a PENDING payout the batch then
+  // disburses in full — paying the seller for an order the buyer was refunded.
+  if (order.status === "REFUNDED" || order.status === "CANCELLED") {
+    polog.warn({ orderId, status: order.status }, "skipping payout enqueue for settled (refunded/cancelled) order");
+    return { created: [] };
+  }
   const fxRate = Number(order.fxRate);
+  // Start of the hold window. deliveredAt is normally set by the DELIVERED
+  // transition just before this runs; fall back to now for safety.
+  const eligibleAt = order.deliveredAt ?? new Date();
 
   // Group items by shop.
   const byShop = new Map<string, { itemIds: string[]; subtotal: number }>();
@@ -61,74 +89,51 @@ export async function enqueuePayouts(orderId: string): Promise<EnqueuePayoutsRes
   const created: EnqueuePayoutsResult["created"] = [];
 
   for (const [shopId, group] of byShop) {
-    // Idempotency: one Payout per (orderId, shopId).
+    const netUsd = shopNetUsdCents(group.subtotal);
+    const amountInrPaise = usdCentsToInrPaiseAt(netUsd, fxRate);
+
+    // Idempotency: one Payout per (orderId, shopId). A held payout already
+    // exists (duplicate delivery event) → nothing to do; the batch will disburse
+    // it. No escrow heal needed — RELEASE is recorded at disbursement, not here.
     const existing = await prisma.payout.findUnique({
       where: { orderId_shopId: { orderId, shopId } },
       select: { id: true },
     });
     if (existing) continue;
 
-    const netUsd = shopNetUsdCents(group.subtotal);
-    const amountInrPaise = usdCentsToInrPaiseAt(netUsd, fxRate);
-
-    let payout: { id: string };
     try {
-      payout = await prisma.payout.create({
+      const payout = await prisma.payout.create({
         data: {
           shopId,
           orderId,
-          status: "PROCESSING",
+          status: "PENDING",
           amountInrPaise,
           orderItemIds: group.itemIds,
+          eligibleAt,
         },
         select: { id: true },
       });
+      created.push({ payoutId: payout.id, shopId, amountInrPaise });
     } catch (err) {
-      // Lost a race to a concurrent release for the same (orderId, shopId).
+      // Lost a race to a concurrent enqueue for the same (orderId, shopId).
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") continue;
       throw err;
     }
-
-    // Look up the shop's Razorpay fund account (set during onboarding).
-    const bank = await prisma.bankAccount.findUnique({
-      where: { shopId },
-      select: { razorpayFundAccountId: true },
-    });
-
-    if (bank?.razorpayFundAccountId) {
-      const res = await razorpayCreatePayout({
-        fundAccountId: bank.razorpayFundAccountId,
-        amountInrPaise,
-        reference: payoutReference(orderId, shopId),
-      });
-      await prisma.payout.update({
-        where: { id: payout.id },
-        data: { razorpayPayoutId: res.payoutId },
-      });
-    } else {
-      // No fund account yet: the Payout row stays PROCESSING with NO provider
-      // payout id — it is STRANDED and the seller is NOT paid until ops wires
-      // the bank and calls retryPayout / retryStrandedPayoutsForShop. Alert so a
-      // silently-unpaid seller surfaces instead of rotting.
-      alertStrandedPayout({ payoutId: payout.id, shopId, orderId, amountInrPaise });
-    }
-
-    created.push({ payoutId: payout.id, shopId, amountInrPaise });
   }
 
   return { created };
 }
 
 /** Stable RazorpayX idempotency reference for a (order, shop) payout. Shared by
- * enqueuePayouts and retryPayout so a retry dedups against the original attempt
+ * runPayoutBatch and retryPayout so a retry dedups against the original attempt
  * at the gateway rather than double-paying. */
-function payoutReference(orderId: string | null, shopId: string): string {
+export function payoutReference(orderId: string | null, shopId: string): string {
   return `${orderId}_${shopId}`;
 }
 
 /** Alert (log + Sentry) that a payout could not be disbursed and the seller is
  * unpaid until it is retried. Never throws. */
-function alertStrandedPayout(info: {
+export function alertStrandedPayout(info: {
   payoutId: string;
   shopId: string;
   orderId: string | null;
@@ -352,51 +357,33 @@ export async function markPayoutFailed(input: {
     where: { id: payout.id },
     data: { status: "FAILED", failureReason: input.reason ?? null },
   });
-}
 
-/**
- * Clawback path: reverse every not-yet-reversed payout tied to an order after a
- * buyer-favored dispute/refund on a DELIVERED order (payouts already released).
- * Writes a PayoutReversal ledger row and flips the payout to REVERSED. Failures
- * are logged to Sentry but never throw — a clawback hiccup must not block the
- * buyer's refund. No-op when no payouts were disbursed (pre-delivery case).
- */
-export async function reversePayoutsForOrder(
-  orderId: string,
-  reason?: string,
-): Promise<{ reversed: number }> {
-  const payouts = await prisma.payout.findMany({
-    where: { orderId, status: { in: ["PROCESSING", "PAID"] } },
-    select: { id: true, amountInrPaise: true, razorpayPayoutId: true },
-  });
-
-  let reversed = 0;
-  for (const p of payouts) {
+  // Escrow: runPayoutBatch records a RELEASE when it flips the payout to
+  // PROCESSING (disbursement initiated), BEFORE it actually succeeds. A FAILED
+  // payout means the seller received NOTHING, so net that RELEASE back down —
+  // otherwise releasedUsdCents stays
+  // inflated by funds nobody got, and reconcile() (which only checks arithmetic
+  // balance) never surfaces it. Idempotent per (orderId, shopId); best-effort so
+  // a ledger hiccup never blocks the failure bookkeeping. retryPayout refuses a
+  // FAILED payout, so this reversal is terminal and safe.
+  if (payout.orderId) {
     try {
-      const { reversalRef } = await razorpayReversePayout({
-        payoutId: p.razorpayPayoutId ?? p.id,
-        amountInrPaise: p.amountInrPaise,
-        reason,
+      await reverseReleaseEscrow({
+        orderId: payout.orderId,
+        shopId: payout.shopId,
+        reason: input.reason ?? "payout failed",
       });
-      await prisma.$transaction([
-        prisma.payoutReversal.create({
-          data: {
-            payoutId: p.id,
-            amountInrPaise: p.amountInrPaise,
-            reason: reason ?? null,
-            reversalRef,
-          },
-        }),
-        prisma.payout.update({
-          where: { id: p.id },
-          data: { status: "REVERSED", reversedAt: new Date(), reversalId: reversalRef },
-        }),
-      ]);
-      reversed += 1;
     } catch (err) {
-      polog.error({ err, payoutId: p.id, orderId }, "payout reversal failed");
-      Sentry.captureException(err, { extra: { payoutId: p.id, orderId, phase: "payout-reversal" } });
+      polog.error({ err, payoutId: payout.id }, "escrow release reversal on payout failure failed");
+      Sentry.captureException(err, {
+        extra: { payoutId: payout.id, phase: "escrow-release-reversal-failed" },
+      });
     }
   }
-  return { reversed };
 }
+
+// Clawback + reinstatement live in src/lib/payout-clawback.ts (per-shop partial
+// clawback + seller-favored-dispute reinstatement) to keep this file small;
+// re-exported here so callers keep importing from "@/lib/payouts".
+export { reversePayoutsForOrder, reinstatePayoutForShop } from "@/lib/payout-clawback";
+export type { ReinstateResult } from "@/lib/payout-clawback";

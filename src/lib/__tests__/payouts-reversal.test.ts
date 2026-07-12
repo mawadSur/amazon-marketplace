@@ -62,34 +62,35 @@ const db = prisma as unknown as {
 
 afterEach(() => vi.clearAllMocks());
 
-describe("enqueuePayouts — missing fund account strands the payout", () => {
-  it("creates a PROCESSING payout, never calls RazorpayX, and alerts", async () => {
+describe("enqueuePayouts — creates a HELD payout at delivery (no disbursement)", () => {
+  it("creates a PENDING payout with eligibleAt and never touches the gateway", async () => {
+    const deliveredAt = new Date("2026-02-01T00:00:00Z");
     db.order.findUnique.mockResolvedValue({
       id: "order1",
       fxRate: 80,
+      deliveredAt,
       items: [{ id: "oi1", shopId: "shopA", qty: 1, unitPriceUsdCents: 1000 }],
     });
     db.payout.findUnique.mockResolvedValue(null); // no existing payout
     db.payout.create.mockResolvedValue({ id: "payout1" });
-    db.bankAccount.findUnique.mockResolvedValue({ razorpayFundAccountId: null }); // NO fund account
 
     const res = await enqueuePayouts("order1");
 
     expect(res.created).toEqual([
       { payoutId: "payout1", shopId: "shopA", amountInrPaise: 80000 },
     ]);
-    // Row created as PROCESSING...
+    // Row created as PENDING (held), eligibleAt = deliveredAt — funds stay in
+    // escrow until the weekly batch disburses.
     expect(db.payout.create).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ status: "PROCESSING" }) }),
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "PENDING", eligibleAt: deliveredAt }),
+      }),
     );
-    // ...but the gateway was NEVER called and no razorpayPayoutId was written.
+    // No fund-account lookup, no gateway call, no strand alert at delivery — all
+    // of that moves to runPayoutBatch.
+    expect(db.bankAccount.findUnique).not.toHaveBeenCalled();
     expect(razorpayCreatePayout).not.toHaveBeenCalled();
-    expect(db.payout.update).not.toHaveBeenCalled();
-    // The seller-unpaid condition surfaced.
-    expect(Sentry.captureException).toHaveBeenCalledWith(
-      expect.objectContaining({ message: "PAYOUT_STRANDED" }),
-      expect.anything(),
-    );
+    expect(Sentry.captureException).not.toHaveBeenCalled();
   });
 });
 

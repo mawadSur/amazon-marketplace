@@ -19,7 +19,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // ── Mocks (hoisted by vitest) ──────────────────────────────────────────────
 vi.mock("@/lib/db", () => ({
   prisma: {
-    order: { findUnique: vi.fn(), updateMany: vi.fn() },
+    order: { findUnique: vi.fn(), updateMany: vi.fn(), update: vi.fn() },
+    orderItem: { updateMany: vi.fn() },
     payment: { update: vi.fn() },
     product: { updateMany: vi.fn() },
     processedWebhookEvent: { findUnique: vi.fn(), create: vi.fn() },
@@ -28,6 +29,13 @@ vi.mock("@/lib/db", () => ({
 }));
 vi.mock("@/lib/queue", () => ({ getQueue: vi.fn(() => ({ add: vi.fn() })) }));
 vi.mock("@/lib/buyer-protection", () => ({ createBuyerProtection: vi.fn() }));
+// Escrow ledger is exercised in escrow.test.ts / escrow-lifecycle.test.ts; here
+// it's mocked so the capture/refund branch logic is tested in isolation.
+vi.mock("@/lib/escrow", () => ({
+  holdEscrow: vi.fn(() => Promise.resolve()),
+  refundEscrow: vi.fn(() => Promise.resolve(true)),
+  getRefundedUsdCents: vi.fn(() => Promise.resolve(0)),
+}));
 vi.mock("@/lib/trust-score", () => ({ enqueueTrustRecompute: vi.fn() }));
 vi.mock("@/lib/email", () => ({
   sendOrderConfirmation: vi.fn(() => Promise.resolve({ sent: true })),
@@ -52,7 +60,12 @@ import { stripeRefund } from "@/lib/stubs";
 import * as Sentry from "@sentry/nextjs";
 
 const db = prisma as unknown as {
-  order: { findUnique: ReturnType<typeof vi.fn>; updateMany: ReturnType<typeof vi.fn> };
+  order: {
+    findUnique: ReturnType<typeof vi.fn>;
+    updateMany: ReturnType<typeof vi.fn>;
+    update: ReturnType<typeof vi.fn>;
+  };
+  orderItem: { updateMany: ReturnType<typeof vi.fn> };
   payment: { update: ReturnType<typeof vi.fn> };
   product: { updateMany: ReturnType<typeof vi.fn> };
   processedWebhookEvent: { findUnique: ReturnType<typeof vi.fn>; create: ReturnType<typeof vi.fn> };
@@ -76,7 +89,11 @@ function placedOrder(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   // Default: $transaction runs its callback with the mocked client as `tx`
   // (tx === prisma), so all the tx.* calls hit the same configured mocks.
-  db.$transaction.mockImplementation(async (fn: (tx: unknown) => unknown) => fn(prisma));
+  db.$transaction.mockImplementation(async (arg: unknown) =>
+    typeof arg === "function"
+      ? (arg as (tx: unknown) => unknown)(prisma)
+      : Promise.all(arg as unknown[]),
+  );
   db.processedWebhookEvent.findUnique.mockResolvedValue(null);
   db.processedWebhookEvent.create.mockResolvedValue({});
   db.order.updateMany.mockResolvedValue({ count: 1 });
@@ -294,6 +311,33 @@ describe("refundOrder — idempotency", () => {
       "buyer@example.com",
       expect.objectContaining({ orderId: "order_1", amountUsdCents: 10_000 }),
     );
+  });
+
+  it("marks EVERY item + the order REFUNDED so a later per-shop dispute can't double-refund", async () => {
+    db.order.findUnique.mockResolvedValue({
+      id: "order_1",
+      status: "PAID",
+      buyer: { email: "buyer@example.com" },
+      payment: {
+        id: "pay_1",
+        status: "CAPTURED",
+        providerChargeId: "ch_1",
+        providerIntentId: "pi_1",
+        amountUsdCents: 10_000,
+      },
+    });
+
+    await refundOrder({ orderId: "order_1", reason: "chargeback" });
+
+    // Whole-order refund flips all items REFUNDED (openDispute then rejects them).
+    expect(db.orderItem.updateMany).toHaveBeenCalledWith({
+      where: { orderId: "order_1" },
+      data: { status: "REFUNDED" },
+    });
+    expect(db.order.update).toHaveBeenCalledWith({
+      where: { id: "order_1" },
+      data: { status: "REFUNDED" },
+    });
   });
 
   it("is a no-op when the payment is already REFUNDED (never double-refunds)", async () => {

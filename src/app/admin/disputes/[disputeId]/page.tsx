@@ -69,7 +69,10 @@ export default async function AdminDisputeDetailPage({
             Dispute on order #{dispute.orderId.slice(-8)}
           </h1>
           <p className="text-sm text-muted-foreground">
-            Opened {new Date(dispute.openedAt).toLocaleString()} by{" "}
+            Against <span className="font-medium">{dispute.shop.name}</span> ·{" "}
+            {dispute.orderItemIds.length} item
+            {dispute.orderItemIds.length === 1 ? "" : "s"} · Opened{" "}
+            {new Date(dispute.openedAt).toLocaleString()} by{" "}
             {dispute.openedBy.email ?? dispute.openedBy.name ?? dispute.openedBy.phone ?? "buyer"}
           </p>
         </div>
@@ -136,31 +139,40 @@ export default async function AdminDisputeDetailPage({
               </span>
             </div>
             <ul className="space-y-2 border-t pt-2">
-              {order.items.map((it) => (
-                <li key={it.id} className="flex items-start gap-3">
-                  <div className="h-10 w-10 flex-shrink-0 overflow-hidden rounded-md bg-muted">
-                    {it.product.images[0]?.url ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        src={it.product.images[0].url}
-                        alt=""
-                        className="h-full w-full object-cover"
-                      />
-                    ) : null}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <Link
-                      href={`/admin/listings/${it.product.id}`}
-                      className="truncate text-sm font-medium hover:underline"
-                    >
-                      {it.product.title}
-                    </Link>
-                    <p className="text-xs text-muted-foreground">
-                      qty {it.qty} · shop {it.product.shopId.slice(-6)}
-                    </p>
-                  </div>
-                </li>
-              ))}
+              {order.items.map((it) => {
+                const isDisputed = dispute.orderItemIds.includes(it.id);
+                return (
+                  <li
+                    key={it.id}
+                    className={`flex items-start gap-3 rounded-md ${
+                      isDisputed ? "bg-amber-50 p-2 ring-1 ring-amber-200" : ""
+                    }`}
+                  >
+                    <div className="h-10 w-10 flex-shrink-0 overflow-hidden rounded-md bg-muted">
+                      {it.product.images[0]?.url ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={it.product.images[0].url}
+                          alt=""
+                          className="h-full w-full object-cover"
+                        />
+                      ) : null}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <Link
+                        href={`/admin/listings/${it.product.id}`}
+                        className="truncate text-sm font-medium hover:underline"
+                      >
+                        {it.product.title}
+                      </Link>
+                      <p className="text-xs text-muted-foreground">
+                        qty {it.qty} · shop {it.product.shopId.slice(-6)}
+                        {isDisputed ? " · disputed" : ""} · {it.status.toLowerCase()}
+                      </p>
+                    </div>
+                  </li>
+                );
+              })}
             </ul>
             <Link
               href={`/admin/orders/${order.id}`}

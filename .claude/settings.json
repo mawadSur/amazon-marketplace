@@ -166,7 +166,7 @@
       "Bash(npx @claude-flow*)",
       "Bash(npx claude-flow*)",
       "Bash(node .claude/*)",
-      "mcp__claude-flow__:*"
+      "mcp__claude-flow__*"
     ],
     "deny": [
       "Read(./.env)",
@@ -182,12 +182,12 @@
     "version": "3.0.0",
     "enabled": true,
     "platform": {
-      "os": "linux",
-      "arch": "x64",
-      "shell": "bash"
+      "os": "darwin",
+      "arch": "arm64",
+      "shell": "zsh"
     },
     "modelPreferences": {
-      "default": "claude-opus-4-7",
+      "default": "claude-opus-4-8",
       "routing": "claude-haiku-4-5-20251001"
     },
     "agentTeams": {

@@ -3,6 +3,7 @@
 // src/lib/fees.ts; FX comes from src/lib/stubs.ts. No external I/O here.
 
 import { Prisma } from "@prisma/client";
+import type { OrderItemStatus, OrderStatus } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { FX_USD_TO_INR } from "@/lib/stubs";
 import { usdCentsToInrPaiseAt } from "@/lib/fx";
@@ -128,6 +129,58 @@ export async function createOrderFromCart(
   });
 
   return { orderId: order.id, totalUsdCents: order.totalUsdCents };
+}
+
+/**
+ * Derive an order's headline status after per-shop disputes resolve (Wave 2).
+ * With per-shop disputes Order.status can't be a single all-or-nothing flag, so:
+ *   - any dispute still OPEN/UNDER_REVIEW  → DISPUTED (order stays flagged)
+ *   - no open disputes AND every item REFUNDED → REFUNDED (whole order refunded)
+ *   - no open disputes AND some items still active → back to the fulfillment
+ *     status (DELIVERED if delivered, else PAID); per-item REFUNDED marks carry
+ *     the partial-refund detail instead of the order-level flag.
+ * Pure/​testable — the caller supplies the item statuses + open-dispute flag.
+ */
+export function deriveOrderStatus(input: {
+  hasOpenDisputes: boolean;
+  itemStatuses: OrderItemStatus[];
+  deliveredAt: Date | null;
+}): Extract<OrderStatus, "DISPUTED" | "REFUNDED" | "DELIVERED" | "PAID"> {
+  if (input.hasOpenDisputes) return "DISPUTED";
+  const allRefunded =
+    input.itemStatuses.length > 0 && input.itemStatuses.every((s) => s === "REFUNDED");
+  if (allRefunded) return "REFUNDED";
+  return input.deliveredAt ? "DELIVERED" : "PAID";
+}
+
+/**
+ * Recompute + persist Order.status from the current per-item statuses and
+ * open-dispute count, inside the caller's transaction. Used by dispute
+ * resolution so an order that had one of several shops refunded settles to the
+ * right headline status. Runs on a tx client so it commits atomically with the
+ * resolution.
+ */
+export async function refreshOrderStatusAfterDisputeResolution(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+): Promise<void> {
+  const [openDisputes, order] = await Promise.all([
+    tx.dispute.count({
+      where: { orderId, status: { in: ["OPEN", "UNDER_REVIEW"] } },
+    }),
+    tx.order.findUnique({
+      where: { id: orderId },
+      select: { deliveredAt: true, items: { select: { status: true } } },
+    }),
+  ]);
+  if (!order) return;
+
+  const next = deriveOrderStatus({
+    hasOpenDisputes: openDisputes > 0,
+    itemStatuses: order.items.map((i) => i.status),
+    deliveredAt: order.deliveredAt,
+  });
+  await tx.order.update({ where: { id: orderId }, data: { status: next } });
 }
 
 const buyerOrderInclude = {

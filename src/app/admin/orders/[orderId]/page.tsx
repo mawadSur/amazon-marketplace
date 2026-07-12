@@ -207,17 +207,34 @@ export default async function AdminOrderDetailPage({
         </Card>
       </div>
 
-      {order.dispute ? (
+      {order.disputes.length > 0 ? (
         <Card>
           <CardHeader>
-            <CardTitle className="text-sm">Dispute</CardTitle>
+            <CardTitle className="text-sm">
+              Disputes ({order.disputes.length})
+            </CardTitle>
           </CardHeader>
-          <CardContent className="space-y-1 text-sm">
-            <div>
-              Status: <StatusPill value={order.dispute.status} /> · Reason:{" "}
-              {order.dispute.reason.toLowerCase()}
-            </div>
-            <p className="text-muted-foreground">{order.dispute.description}</p>
+          <CardContent className="space-y-3 text-sm">
+            {order.disputes.map((d) => (
+              <div key={d.id} className="space-y-1 border-b pb-2 last:border-0 last:pb-0">
+                <div>
+                  Shop: <span className="font-medium">{d.shop.name}</span> ·
+                  Status: <StatusPill value={d.status} /> · Reason:{" "}
+                  {d.reason.toLowerCase()}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {d.orderItemIds.length} item
+                  {d.orderItemIds.length === 1 ? "" : "s"} disputed
+                </p>
+                <p className="text-muted-foreground">{d.description}</p>
+                <Link
+                  href={`/admin/disputes/${d.id}`}
+                  className="text-xs underline"
+                >
+                  Review dispute →
+                </Link>
+              </div>
+            ))}
           </CardContent>
         </Card>
       ) : null}

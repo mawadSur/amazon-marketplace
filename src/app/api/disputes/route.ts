@@ -8,6 +8,9 @@ import { openDispute } from "@/lib/disputes";
 
 const bodySchema = z.object({
   orderId: z.string().min(1),
+  // The specific items being disputed. All must belong to ONE shop (enforced
+  // server-side) — a dispute is per-shop.
+  orderItemIds: z.array(z.string().min(1)).min(1).max(100),
   reason: z.enum([
     "NOT_RECEIVED",
     "NOT_AS_DESCRIBED",
@@ -46,6 +49,7 @@ export async function POST(req: Request) {
     const dispute = await openDispute({
       orderId: parsed.data.orderId,
       buyerId: session.user.id,
+      orderItemIds: parsed.data.orderItemIds,
       reason: parsed.data.reason,
       description: parsed.data.description,
       evidenceUrls: parsed.data.evidenceUrls,
@@ -58,7 +62,13 @@ export async function POST(req: Request) {
         ? 404
         : msg === "ALREADY_DISPUTED"
           ? 409
-          : msg === "ORDER_NOT_DISPUTABLE" || msg === "DESCRIPTION_REQUIRED"
+          : msg === "ORDER_NOT_DISPUTABLE" ||
+              msg === "DESCRIPTION_REQUIRED" ||
+              msg === "ITEMS_REQUIRED" ||
+              msg === "ITEMS_INVALID" ||
+              msg === "ITEMS_MULTIPLE_SHOPS" ||
+              msg === "ITEMS_NOT_DISPUTABLE" ||
+              msg === "CLAIM_WINDOW_EXPIRED"
             ? 400
             : 500;
     return NextResponse.json({ error: msg }, { status });

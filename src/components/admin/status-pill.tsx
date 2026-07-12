@@ -46,6 +46,21 @@ const TONES: Record<string, Tone> = {
   NOT_SUBMITTED: "neutral",
   SUBMITTED: "info",
   VERIFIED: "success",
+  // Payout ops (admin-derived)
+  STRANDED: "danger",
+  // Shipment
+  LABEL_PENDING: "neutral",
+  LABEL_CREATED: "info",
+  PICKED_UP: "info",
+  IN_TRANSIT: "info",
+  CUSTOMS: "info",
+  OUT_FOR_DELIVERY: "info",
+  EXCEPTION: "danger",
+  RETURNED: "warn",
+  // Buyer protection
+  ELIGIBLE: "neutral",
+  CLAIMED: "warn",
+  DENIED: "danger",
   // Dispute
   OPEN: "warn",
   UNDER_REVIEW: "info",
