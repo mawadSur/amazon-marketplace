@@ -145,8 +145,9 @@ jobs:
 
       # Register a SHA-pinned migrate revision (base task def with the worker
       # :${sha} image) and run it in-VPC. The migrate SG (CDK output
-      # MigrateSecurityGroupId) can reach RDS on 5432; DIRECT_URL comes from
-      # Secrets Manager. We wait for the task to stop and assert exit 0.
+      # MigrateSecurityGroupId) has egress to Supabase via the NAT gateway;
+      # DATABASE_URL/DIRECT_URL come from the Secrets Manager app secret. We
+      # wait for the task to stop and assert exit 0.
       - name: Run prisma migrate deploy
         run: |
           set -euo pipefail

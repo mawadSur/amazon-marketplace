@@ -60,7 +60,7 @@ export class MarketplaceStack extends Stack {
     new CfnOutput(this, "MigrateTaskDefArn", { value: compute.migrateTask.taskDefinitionArn });
     // Wire these into deploy.yml's migrate job (vars ECS_MIGRATE_SUBNETS +
     // ECS_MIGRATE_SECURITY_GROUPS) so `prisma migrate deploy` runs in-VPC and
-    // can reach RDS on 5432.
+    // can reach Supabase Postgres over the NAT gateway.
     new CfnOutput(this, "MigrateSubnetIds", {
       value: network.vpc.selectSubnets({
         subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
@@ -72,7 +72,6 @@ export class MarketplaceStack extends Stack {
     new CfnOutput(this, "AlarmTopicArn", { value: compute.alarmTopic.topicArn });
     new CfnOutput(this, "AlbDnsName", { value: compute.alb.loadBalancerDnsName });
     new CfnOutput(this, "AppSecretArn", { value: data.appSecret.secretArn });
-    new CfnOutput(this, "DbSecretArn", { value: data.dbSecret.secretArn });
     new CfnOutput(this, "RedisPrimaryEndpoint", {
       value: data.redis.attrPrimaryEndPointAddress,
     });

@@ -14,13 +14,18 @@ marketplace. **It is its own npm package** (`infra/package.json`,
     check = `/api/health/ready` (readiness — hard-fails on a real DB outage so
     the LB stops routing),
   - **worker** service (no ingress ports),
-  - a one-off **migrate** task definition (`npx prisma migrate deploy`) with its
-    own security group allowed to reach RDS on 5432.
-- **RDS Postgres** (isolated subnets, encrypted, Multi-AZ in prod).
-- **ElastiCache Redis** with **TLS in transit** + at-rest encryption + AUTH.
+  - a one-off **migrate** task definition (`npx prisma migrate deploy`) that runs
+    in-VPC and reaches Supabase Postgres over the NAT gateway.
+- **Postgres** — external, managed by **Supabase** (no RDS). `DATABASE_URL`
+  (pooled) + `DIRECT_URL` (direct) live in the app secret and are loaded
+  post-deploy; app + migrate tasks reach Supabase over the internet via the NAT
+  gateway.
+- **ElastiCache Redis** with **TLS in transit** + at-rest encryption + AUTH
+  (unchanged).
 - **S3 media bucket** — Block Public Access + KMS CMND + enforced TLS + versioning.
-- **Secrets Manager** — RDS-managed DB secret, generated Redis AUTH, and an
-  aggregated app secret whose keys are injected into task defs.
+- **Secrets Manager** — generated Redis AUTH and an aggregated app secret (which
+  also holds the Supabase `DATABASE_URL`/`DIRECT_URL`) whose keys are injected
+  into task defs.
 - **CloudFront + Route53 + ACM** — public HTTPS edge in front of the internal
   ALB via a CloudFront **VPC origin** (only when `domainName`/`hostedZoneId`
   are provided).
@@ -88,8 +93,8 @@ npx cdk deploy \
    in `lib/compute.ts`): `AUTH_SECRET`, `STRIPE_*`, `RAZORPAY_*`, `TWILIO_*`,
    `KYC_*`, `SHIPROCKET_*`, `ANTHROPIC_API_KEY`, `RESEND_API_KEY`, `EMAIL_FROM`,
    `S3_*`, plus `DATABASE_URL`, `DIRECT_URL`, `REDIS_URL`.
-   - `DATABASE_URL` = pooled Postgres URL (from the RDS secret / RDS Proxy).
-   - `DIRECT_URL` = direct Postgres URL used by `prisma migrate deploy`.
+   - `DATABASE_URL` = pooled Supabase Postgres URL (Supabase connection pooler).
+   - `DIRECT_URL` = direct Supabase Postgres URL used by `prisma migrate deploy`.
    - `REDIS_URL` = `rediss://:<authToken>@<RedisPrimaryEndpoint>:6379` (TLS).
 
    ```bash

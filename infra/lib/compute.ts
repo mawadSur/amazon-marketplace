@@ -39,7 +39,7 @@ export class Compute extends Construct {
   readonly workerService: ecs.FargateService;
   readonly migrateTask: ecs.FargateTaskDefinition;
   readonly webSecurityGroup: ec2.SecurityGroup;
-  /** SG for the one-off migrate task; allowed to reach RDS on 5432. */
+  /** SG for the one-off migrate task; reaches Supabase Postgres over egress. */
   readonly migrateSecurityGroup: ec2.SecurityGroup;
   /** SNS topic the CloudWatch alarms publish to (subscribe on-call here). */
   readonly alarmTopic: sns.Topic;
@@ -88,7 +88,6 @@ export class Compute extends Construct {
       ],
     });
     data.appSecret.grantRead(executionRole);
-    data.dbSecret.grantRead(executionRole);
     data.redisAuthSecret.grantRead(executionRole);
 
     const taskRole = new iam.Role(this, "TaskRole", {
@@ -100,10 +99,14 @@ export class Compute extends Construct {
 
     // --- Shared secret env mapping -------------------------------------
     const secretEnv = this.buildSecretEnv(data);
+    const region = process.env.CDK_DEFAULT_REGION ?? "us-east-1";
     const commonEnv = {
       NODE_ENV: "production",
-      AWS_REGION: process.env.CDK_DEFAULT_REGION ?? "us-east-1",
+      AWS_REGION: region,
       S3_BUCKET: data.mediaBucket.bucketName,
+      // Real AWS region for the S3 client (env default is "auto", an R2 convention
+      // the AWS SDK rejects). The bucket lives in the stack's region.
+      S3_REGION: region,
       // Sentry environment tag (DSN itself is injected via secretEnv). Non-secret.
       SENTRY_ENVIRONMENT: stage,
     } as const;
@@ -187,8 +190,8 @@ export class Compute extends Construct {
       deregistrationDelay: Duration.seconds(15),
     });
 
-    // App tasks may reach DB/Redis; DB/Redis only accept from app SGs.
-    data.db.connections.allowFrom(webSg, ec2.Port.tcp(5432), "web -> postgres");
+    // App tasks may reach Redis; Redis only accepts from app SGs. (Postgres is
+    // Supabase — reached over egress via NAT, no SG ingress rule needed.)
     data.redisSecurityGroup.addIngressRule(webSg, ec2.Port.tcp(6379), "web -> redis");
 
     // --- Worker task + service (no ingress) ----------------------------
@@ -218,7 +221,6 @@ export class Compute extends Construct {
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       circuitBreaker: { rollback: true },
     });
-    data.db.connections.allowFrom(workerSg, ec2.Port.tcp(5432), "worker -> postgres");
     data.redisSecurityGroup.addIngressRule(workerSg, ec2.Port.tcp(6379), "worker -> redis");
 
     // --- One-off migrate task (used by deploy.yml release step) ---------
@@ -239,14 +241,14 @@ export class Compute extends Construct {
     });
 
     // The migrate task runs in-VPC via `aws ecs run-task` (deploy.yml), which
-    // needs an explicit SG + subnets. Give it its own SG allowed to reach RDS
-    // on 5432 (it also reaches Secrets Manager via the VPC interface endpoint).
+    // needs an explicit SG + subnets. It reaches Supabase Postgres over the
+    // internet via the NAT gateway (allowAllOutbound is true), and reaches
+    // Secrets Manager via the VPC interface endpoint.
     const migrateSg = new ec2.SecurityGroup(this, "MigrateSg", {
       vpc,
       description: "One-off migrate task",
       allowAllOutbound: true,
     });
-    data.db.connections.allowFrom(migrateSg, ec2.Port.tcp(5432), "migrate -> postgres");
     this.migrateSecurityGroup = migrateSg;
 
     this.webSecurityGroup = webSg;
@@ -270,15 +272,26 @@ export class Compute extends Construct {
       "TWILIO_ACCOUNT_SID",
       "TWILIO_AUTH_TOKEN",
       "TWILIO_VERIFY_SERVICE_SID",
-      "KYC_PROVIDER_API_KEY",
-      "KYC_PROVIDER_BASE_URL",
+      // KYC — Signzy (India PAN/GSTIN). Supersedes the legacy KYC_PROVIDER_* vars,
+      // which are intentionally NOT injected: the app uses Signzy when these are set.
+      "SIGNZY_BASE_URL",
+      "SIGNZY_USERNAME",
+      "SIGNZY_PASSWORD",
+      "SIGNZY_REALM",
+      "SIGNZY_LOGIN_PATH",
+      "SIGNZY_PAN_PATH",
+      "SIGNZY_GSTIN_PATH",
       "SHIPROCKET_EMAIL",
       "SHIPROCKET_PASSWORD",
+      // Webhook HMAC secret — without it Shiprocket shipment webhooks are rejected.
+      "SHIPROCKET_WEBHOOK_SECRET",
       "ANTHROPIC_API_KEY",
       "RESEND_API_KEY",
       "EMAIL_FROM",
-      "S3_ACCESS_KEY_ID",
-      "S3_SECRET_ACCESS_KEY",
+      // S3 media: on AWS the app authenticates with the ECS TASK ROLE (which has
+      // grantReadWrite + KMS encrypt/decrypt on the bucket) — no static keys. For
+      // an external R2/MinIO bucket set S3_ENDPOINT + S3_ACCESS_KEY_ID/SECRET in
+      // the app secret and add them back here instead.
       "S3_PUBLIC_BASE_URL",
       // Server-side Sentry DSN (user-supplied secret; drives error reporting in
       // web + worker + migrate). SENTRY_ENVIRONMENT is set as plain env above.

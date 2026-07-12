@@ -15,19 +15,27 @@ let _client: S3Client | null = null;
 
 function client(): S3Client {
   if (_client) return _client;
-  if (!env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY || !env.S3_BUCKET) {
-    throw new Error(
-      "Object storage not configured (S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY / S3_BUCKET).",
-    );
+  if (!env.S3_BUCKET) {
+    throw new Error("Object storage not configured (S3_BUCKET).");
   }
+  // Explicit keys are for external R2/MinIO (paired with S3_ENDPOINT). On AWS we
+  // deliberately set NO static keys and let the SDK's default credential provider
+  // chain resolve the ECS task role — which the CDK grants S3 read/write + KMS
+  // encrypt/decrypt on the bucket. Requiring static keys here would both defeat
+  // that and fail on the KMS-encrypted bucket.
+  const hasExplicitKeys = Boolean(env.S3_ACCESS_KEY_ID && env.S3_SECRET_ACCESS_KEY);
   _client = new S3Client({
     region: env.S3_REGION,
     endpoint: env.S3_ENDPOINT || undefined,
     forcePathStyle: !!env.S3_ENDPOINT, // R2/MinIO style
-    credentials: {
-      accessKeyId: env.S3_ACCESS_KEY_ID,
-      secretAccessKey: env.S3_SECRET_ACCESS_KEY,
-    },
+    ...(hasExplicitKeys
+      ? {
+          credentials: {
+            accessKeyId: env.S3_ACCESS_KEY_ID as string,
+            secretAccessKey: env.S3_SECRET_ACCESS_KEY as string,
+          },
+        }
+      : {}),
   });
   return _client;
 }

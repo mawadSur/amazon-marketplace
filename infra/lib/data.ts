@@ -1,12 +1,12 @@
-// Stateful layer: RDS Postgres, ElastiCache Redis (TLS), S3 media bucket
-// (Block Public Access + KMS), and the app secret in Secrets Manager.
+// Stateful layer: ElastiCache Redis (TLS), S3 media bucket (Block Public
+// Access + KMS), and the app secret in Secrets Manager. Postgres is external
+// (Supabase); its connection strings live in the app secret.
 
 import { Construct } from "constructs";
 import {
   Duration,
   RemovalPolicy,
   aws_ec2 as ec2,
-  aws_rds as rds,
   aws_elasticache as elasticache,
   aws_s3 as s3,
   aws_kms as kms,
@@ -19,8 +19,6 @@ export interface DataProps {
 }
 
 export class Data extends Construct {
-  readonly db: rds.DatabaseInstance;
-  readonly dbSecret: secrets.ISecret;
   readonly redis: elasticache.CfnReplicationGroup;
   readonly redisSecurityGroup: ec2.SecurityGroup;
   readonly redisAuthSecret: secrets.Secret;
@@ -57,35 +55,10 @@ export class Data extends Construct {
       ],
     });
 
-    // --- RDS Postgres --------------------------------------------------
-    const dbSg = new ec2.SecurityGroup(this, "DbSg", {
-      vpc,
-      description: "RDS Postgres — ingress only from app tasks",
-      allowAllOutbound: false,
-    });
-    this.db = new rds.DatabaseInstance(this, "Postgres", {
-      engine: rds.DatabaseInstanceEngine.postgres({
-        version: rds.PostgresEngineVersion.VER_16_4,
-      }),
-      vpc,
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
-      securityGroups: [dbSg],
-      instanceType: ec2.InstanceType.of(
-        ec2.InstanceClass.BURSTABLE4_GRAVITON,
-        ec2.InstanceSize.MEDIUM,
-      ),
-      allocatedStorage: 50,
-      maxAllocatedStorage: 200,
-      storageEncrypted: true,
-      multiAz: stage === "prod",
-      backupRetention: Duration.days(stage === "prod" ? 14 : 3),
-      deletionProtection: stage === "prod",
-      removalPolicy: RemovalPolicy.RETAIN,
-      credentials: rds.Credentials.fromGeneratedSecret("shezmin_app"),
-      databaseName: "shezmin",
-      cloudwatchLogsExports: ["postgresql"],
-    });
-    this.dbSecret = this.db.secret!;
+    // --- Postgres (external: Supabase) ---------------------------------
+    // No RDS here. DATABASE_URL (Supabase pooled) + DIRECT_URL (Supabase
+    // direct) are supplied via the appSecret and loaded post-deploy; app
+    // tasks reach Supabase over the internet via the NAT gateway.
 
     // --- ElastiCache Redis (TLS + AUTH) --------------------------------
     this.redisSecurityGroup = new ec2.SecurityGroup(this, "RedisSg", {
